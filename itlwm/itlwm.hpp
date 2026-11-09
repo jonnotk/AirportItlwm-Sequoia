@@ -80,6 +80,33 @@ public:
     virtual IOReturn setWakeOnMagicPacket( bool active ) override;
     
     void releaseAll();
+    bool cleanupLegacy(IOService *provider, bool freeing = false);
+    bool fLegacyCleanupInProgress = false, fLegacyStartInProgress = false, fLegacyBaseStarted = false, fLegacyBaseStartInProgress = false;
+    bool fLegacyHalAttachAttempted = false, fLegacyHalAttached = false, fLegacyHalAttachInProgress = false;
+    bool fLegacyInterfaceAttached = false, fLegacyInterfaceAttachInProgress = false;
+    bool fLegacyChildTerminationRequested = false, fLegacyEthernetAttached = false, fLegacyCommandGateAdded = false;
+    void closeControllerTimerAdmission();
+    bool holdControllerTimerOwner();
+    bool quiesceControllerTimers();
+    bool releaseControllerTimerReferences();
+    bool controllerTimersClosing();
+    bool armControllerWatchdog();
+    struct ControllerTimerFrame {
+        itlwm *owner = NULL;
+        void *thread = NULL;
+        ControllerTimerFrame *next = NULL;
+        IOTimerEventSource *source = NULL;
+        bool rearm = false;
+        ~ControllerTimerFrame();
+    };
+    bool beginControllerTimer(ControllerTimerFrame *, IOTimerEventSource *, bool scan);
+    void endControllerTimer(ControllerTimerFrame *);
+    IOLock *fControllerTimerLock;
+    bool fControllerTimerClosing, fControllerTimerDraining, fControllerTimerOwnerHeld;
+    ControllerTimerFrame *fControllerTimerFrames;
+    IOTimerEventSource *fRetiredWatchdogTimer, *fRetiredScanTimer;
+    bool fWatchdogTimerAdded, fScanSourceAdded;
+
     void joinSSID(const char *ssid, const char *pwd);
     void associateSSID(const char *ssid, const char *pwd);
     void watchdogAction(IOTimerEventSource *timer);
@@ -92,22 +119,29 @@ public:
     static IOReturn tsleepHandler(OSObject* owner, void* arg0 = 0, void* arg1 = 0, void* arg2 = 0, void* arg3 = 0);
     void setPowerStateOff(void);
     void setPowerStateOn(void);
-    void unregistPM();
+    bool unregistPM(bool permanent = true);
+    struct PowerCallFrame { void *thread; PowerCallFrame *next; };
+    void beginPowerCall(PowerCallFrame *);
+    void endPowerCall(PowerCallFrame *);
     
     bool createMediumTables(const IONetworkMedium **primary);
     
 public:
     IOInterruptEventSource* fInterrupt;
     IOTimerEventSource *watchdogTimer;
-    IOPCIDevice *pciNub;
-    IONetworkStats *fpNetStats;
-    IOEthernetInterface *fNetIf;
-    IOWorkLoop *fWatchdogWorkLoop;
-    ItlHalService *fHalService;
+    IOPCIDevice *pciNub = NULL;
+    IONetworkStats *fpNetStats = NULL;
+    IOEthernetInterface *fNetIf = NULL;
+    IOWorkLoop *fWatchdogWorkLoop = NULL;
+    ItlHalService *fHalService = NULL;
     
     //pm
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
+    IOLock *fPowerCallLock;
+    bool fPowerCallAdmission, fPowerCallStopping, fPowerCallDraining, fPowerCallOwnerHeld;
+    PowerCallFrame *fPowerCallFrames;
+    unsigned fPowerCallOutstanding;
     UInt32 pmPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;

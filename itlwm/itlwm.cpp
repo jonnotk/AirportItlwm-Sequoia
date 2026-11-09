@@ -22,6 +22,13 @@
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
+#include <HAL/AiritlDebug.h>
+
+// Gated debug logging (see include/HAL/AiritlDebug.h). This target's own
+// definition: the itlwm kext does not compile AirportItlwmV2.cpp.
+extern "C" {
+int airitl_debug_log = 0;
+}
 
 #define super IOEthernetController
 OSDefineMetaClassAndStructors(itlwm, IOEthernetController)
@@ -30,9 +37,33 @@ OSDefineMetaClassAndStructors(CTimeout, OSObject)
 IOWorkLoop *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
+#define ITL_CONTROLLER_CLASS itlwm
+#define ITL_CONTROLLER_HAS_SCAN 0
+#include <HAL/ItlControllerTimers.inc>
+#undef ITL_CONTROLLER_HAS_SCAN
+#undef ITL_CONTROLLER_CLASS
+
 bool itlwm::init(OSDictionary *properties)
 {
-    return super::init(properties);
+    bool ret = super::init(properties);
+    fPowerCallLock = ret ? IOLockAlloc() : NULL;
+    fPowerCallAdmission = fPowerCallStopping = fPowerCallDraining = fPowerCallOwnerHeld = false;
+    fPowerCallFrames = NULL;
+    fPowerCallOutstanding = 0;
+    powerOffThreadCall = powerOnThreadCall = NULL;
+    pmPolicyMaker = NULL;
+    pmPowerState = kPowerStateOn;
+    fControllerTimerLock = ret ? IOLockAlloc() : NULL;
+    fControllerTimerClosing = fControllerTimerDraining = fControllerTimerOwnerHeld = false;
+    fControllerTimerFrames = NULL;
+    fRetiredWatchdogTimer = fRetiredScanTimer = NULL;
+    fWatchdogTimerAdded = fScanSourceAdded = false;
+    watchdogTimer = NULL;
+    fLegacyCleanupInProgress = fLegacyStartInProgress = fLegacyBaseStarted = fLegacyBaseStartInProgress = false;
+    fLegacyHalAttachAttempted = fLegacyHalAttached = fLegacyHalAttachInProgress = false;
+    fLegacyInterfaceAttached = fLegacyInterfaceAttachInProgress = false;
+    fLegacyChildTerminationRequested = fLegacyEthernetAttached = fLegacyCommandGateAdded = false;
+    return ret && fPowerCallLock && fControllerTimerLock;
 }
 
 #define  PCI_MSI_FLAGS        2    /* Message Control */
@@ -67,8 +98,8 @@ IOService* itlwm::probe(IOService *provider, SInt32 *score)
 {
     bool isMatch = false;
     super::probe(provider, score);
-    UInt8 msiCap;
-    UInt8 msixCap;
+    UInt8 msiCap = 0;
+    UInt8 msixCap = 0;
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
     if (!device) {
         return NULL;
@@ -85,6 +116,8 @@ IOService* itlwm::probe(IOService *provider, SInt32 *score)
         isMatch = true;
         fHalService = new ItlIwn;
     }
+    if (isMatch && !fHalService)
+        return NULL;
     if (isMatch) {
         device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
         if (msixCap) {
@@ -122,6 +155,9 @@ bool itlwm::configureInterface(IONetworkInterface *netif)
     }
     ifp->netStat = fpNetStats;
     ether_ifattach(ifp, OSDynamicCast(IOEthernetInterface, netif));
+    IOLockLock(fControllerTimerLock);
+    fLegacyEthernetAttached = true;
+    IOLockUnlock(fControllerTimerLock);
     fpNetStats->collisions = 0;
 #ifdef __PRIVATE_SPI__
     netif->configureOutputPullModel(fHalService->getDriverInfo()->getTxQueueSize(), 0, 0, IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0);
@@ -143,6 +179,8 @@ IOEthernetInterface *itlwm::getNetworkInterface()
 bool itlwm::createMediumTables(const IONetworkMedium **primary)
 {
     IONetworkMedium    *medium;
+    if (primary)
+        *primary = NULL;
     
     OSDictionary *mediumDict = OSDictionary::withCapacity(1);
     if (mediumDict == NULL) {
@@ -151,16 +189,19 @@ bool itlwm::createMediumTables(const IONetworkMedium **primary)
     }
     
     medium = IONetworkMedium::medium(kIOMediumEthernetAuto, 100 * 1000000);
-    IONetworkMedium::addMedium(mediumDict, medium);
-    medium->release();
-    if (primary) {
-        *primary = medium;
+    if (!medium || !IONetworkMedium::addMedium(mediumDict, medium)) {
+        if (medium) medium->release();
+        mediumDict->release();
+        return false;
     }
+    medium->release();
     
     bool result = publishMediumDictionary(mediumDict);
     if (!result) {
         XYLog("Cannot publish medium dictionary!\n");
     }
+    if (result && primary)
+        *primary = medium;
 
     mediumDict->release();
     return result;
@@ -291,13 +332,36 @@ void itlwm::associateSSID(const char *ssid, const char *pwd)
 
 bool itlwm::start(IOService *provider)
 {
-    int boot_value = 0;
-    if (!super::start(provider)) {
+    if (!fControllerTimerLock) return false;
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing || fLegacyStartInProgress || fLegacyBaseStarted) {
+        IOLockUnlock(fControllerTimerLock);
         return false;
     }
+    fLegacyStartInProgress = fLegacyBaseStartInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    struct StartOwner {
+        itlwm *owner;
+        ~StartOwner() { owner->release(); }
+    } startOwner{this};
+    retain();
+    auto failStart = [this, provider]() -> bool {
+        IOLockLock(fControllerTimerLock);
+        fLegacyStartInProgress = false;
+        IOLockUnlock(fControllerTimerLock);
+        cleanupLegacy(provider);
+        return false;
+    };
+    int boot_value = 0;
+    const bool baseStarted = super::start(provider);
+    IOLockLock(fControllerTimerLock);
+    fLegacyBaseStartInProgress = false;
+    fLegacyBaseStarted = baseStarted;
+    IOLockUnlock(fControllerTimerLock);
+    if (!baseStarted || controllerTimersClosing()) return failStart();
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
-        return false;
+        return failStart();
     }
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
@@ -305,70 +369,79 @@ bool itlwm::start(IOService *provider)
     pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
-        return false;
+        return failStart();
     }
     if (initPCIPowerManagment(pciNub) == false) {
-        super::stop(pciNub);
-        return false;
+        return failStart();
     }
     if (_fWorkloop == NULL) {
         XYLog("No _fWorkloop!!\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
     _fCommandGate = IOCommandGate::commandGate(this, (IOCommandGate::Action)itlwm::tsleepHandler);
     if (_fCommandGate == 0) {
         XYLog("No command gate!!\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    _fWorkloop->addEventSource(_fCommandGate);
+    if (_fWorkloop->addEventSource(_fCommandGate) != kIOReturnSuccess) return failStart();
+    fLegacyCommandGateAdded = true;
     const IONetworkMedium *primaryMedium;
     if (!createMediumTables(&primaryMedium) ||
         !setCurrentMedium(primaryMedium) || !setSelectedMedium(primaryMedium)) {
         XYLog("setup medium fail\n");
-        releaseAll();
-        return false;
+        return failStart();
     }
-    fHalService->initWithController(this, _fWorkloop, _fCommandGate);
+    if (!fHalService->initWithController(this, _fWorkloop, _fCommandGate)) {
+        return failStart();
+    }
     
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
+    airitl_debug_log = PE_parse_boot_argn("-airitldbg", &boot_value, sizeof(boot_value)) ? 1 : 0;
     
-    if (!fHalService->attach(pciNub)) {
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing) { IOLockUnlock(fControllerTimerLock); return failStart(); }
+    fLegacyHalAttachAttempted = fLegacyHalAttachInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    const bool halAttached = fHalService->attach(pciNub);
+    IOLockLock(fControllerTimerLock);
+    fLegacyHalAttached = halAttached;
+    fLegacyHalAttachInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (!halAttached || controllerTimersClosing()) {
         XYLog("attach fail\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    if (!attachInterface((IONetworkInterface **)&fNetIf, true)) {
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing) { IOLockUnlock(fControllerTimerLock); return failStart(); }
+    fLegacyInterfaceAttachInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    const bool childAttached = attachInterface((IONetworkInterface **)&fNetIf, true);
+    IOLockLock(fControllerTimerLock);
+    fLegacyInterfaceAttached = childAttached;
+    fLegacyInterfaceAttachInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (!childAttached || controllerTimersClosing()) {
         XYLog("attach to interface fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
     fWatchdogWorkLoop = IOWorkLoop::workLoop();
     if (fWatchdogWorkLoop == NULL) {
         XYLog("init watchdog workloop fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
+    if (!holdControllerTimerOwner()) return failStart();
     watchdogTimer = IOTimerEventSource::timerEventSource(this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &itlwm::watchdogAction));
     if (!watchdogTimer) {
         XYLog("init watchdog fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    fWatchdogWorkLoop->addEventSource(watchdogTimer);
+    if (fWatchdogWorkLoop->addEventSource(watchdogTimer) != kIOReturnSuccess) {
+        return failStart();
+    }
+    fWatchdogTimerAdded = true;
     setLinkStatus(kIONetworkLinkValid);
     OSObject *wifiEntryObject = NULL;
     OSDictionary *wifiEntry = NULL;
@@ -376,6 +449,8 @@ bool itlwm::start(IOService *provider)
     OSDictionary *wifiDict = OSDynamicCast(OSDictionary, getProperty("WiFiConfig"));
     if (wifiDict != NULL) {
         OSCollectionIterator *iterator = OSCollectionIterator::withCollection(wifiDict);
+        if (!iterator)
+            return failStart();
         while ((wifiEntryObject = iterator->getNextObject())) {
             entryKey = OSDynamicCast(OSString, wifiEntryObject);
             if (entryKey == NULL) {
@@ -400,14 +475,23 @@ bool itlwm::start(IOService *provider)
     }
     registerService();
     fNetIf->registerService();
+    IOLockLock(fControllerTimerLock);
+    const bool closed = fControllerTimerClosing;
+    fLegacyStartInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (closed) return failStart();
     return true;
 }
 
 void itlwm::watchdogAction(IOTimerEventSource *timer)
 {
-    struct _ifnet *ifp = getIfp();
-    (*ifp->if_watchdog)(ifp);
-    watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+    ControllerTimerFrame frame;
+    if (!beginControllerTimer(&frame, timer, false)) return;
+    if (fHalService) {
+        auto *ic = fHalService->get80211Controller();
+        if (ic && ic->ic_ac.ac_if.if_watchdog)
+            (*ic->ic_ac.ac_if.if_watchdog)(&ic->ic_ac.ac_if);
+    }
 }
 
 const OSString * itlwm::newVendorString() const
@@ -464,67 +548,128 @@ IOReturn itlwm::selectMedium(const IONetworkMedium *medium) {
 
 void itlwm::stop(IOService *provider)
 {
-    XYLog("%s\n", __FUNCTION__);
-    struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
-    super::stop(provider);
-    setLinkStatus(kIONetworkLinkValid);
-    fHalService->detach(pciNub);
-    ether_ifdetach(ifp);
-    detachInterface(fNetIf, true);
+    cleanupLegacy(provider);
+}
+
+bool itlwm::cleanupLegacy(IOService *provider, bool freeing)
+{
+    struct Lifetime {
+        itlwm *owner;
+        bool held;
+        ~Lifetime() { if (held) owner->release(); }
+    } lifetime{this, !freeing};
+    if (!freeing) retain();
+    closeControllerTimerAdmission();
+    if (fControllerTimerLock) IOLockLock(fControllerTimerLock);
+    if (fLegacyCleanupInProgress) {
+        if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+        return false;
+    }
+    fLegacyCleanupInProgress = true;
+    if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+    struct CleanupOwner {
+        itlwm *owner;
+        ~CleanupOwner() {
+            if (owner->fControllerTimerLock) IOLockLock(owner->fControllerTimerLock);
+            owner->fLegacyCleanupInProgress = false;
+            if (owner->fControllerTimerLock) IOLockUnlock(owner->fControllerTimerLock);
+        }
+    } cleanupOwner{this};
+    if (fControllerTimerLock) IOLockLock(fControllerTimerLock);
+    const bool starting = fLegacyStartInProgress || fLegacyBaseStartInProgress ||
+        fLegacyHalAttachInProgress || fLegacyInterfaceAttachInProgress;
+    if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+    if (starting) return false;
+    const bool pmQuiesced = unregistPM();
+    const bool timersQuiesced = quiesceControllerTimers();
+    if (!pmQuiesced || !timersQuiesced) return false;
+    if (_fWorkloop && _fWorkloop->inGate()) return false;
+    if (fHalService && !fHalService->quiesceForDetach()) return false;
+    if (fHalService && fHalService->teardownMustRetainResources()) return false;
+    auto *ic = fHalService ? fHalService->get80211Controller() : NULL;
+    if (fNetIf) {
+        auto *child = fNetIf;
+        child->retain();
+        auto *childProvider = child->getProvider();
+        if (childProvider && childProvider != this) { child->release(); return false; }
+        if (!childProvider && !fLegacyInterfaceAttached && !fLegacyChildTerminationRequested) {
+            child->release();
+            return false;
+        }
+        if (childProvider == this && !fLegacyChildTerminationRequested) {
+            fLegacyInterfaceAttached = true;
+            fLegacyChildTerminationRequested = true;
+            detachInterface(child, true);
+        }
+        const bool stopped = child->getProvider() == NULL;
+        child->release();
+        // Native stop and provider close precede actual detach. A sync request
+        // may enqueue or time out; preserve dependencies for external retry.
+        if (!stopped) return false;
+        fLegacyInterfaceAttached = false;
+    } else if (fLegacyInterfaceAttached) return false;
+    if (fLegacyBaseStarted) {
+        fLegacyBaseStarted = false;
+        super::stop(provider);
+    }
+    if (fLegacyHalAttachAttempted && fHalService) {
+        fHalService->detach(pciNub);
+        if (fHalService->teardownMustRetainResources()) return false;
+        fLegacyHalAttachAttempted = fLegacyHalAttached = false;
+    }
+    if (fLegacyEthernetAttached && ic) {
+        ether_ifdetach(&ic->ic_ac.ac_if);
+        fLegacyEthernetAttached = false;
+    }
+    if (ic && ic->ic_ac.ac_if.netStat == fpNetStats) ic->ic_ac.ac_if.netStat = NULL;
+    fpNetStats = NULL;
     OSSafeReleaseNULL(fNetIf);
-    releaseAll();
+    if (_fCommandGate) {
+        if (fLegacyCommandGateAdded && (!_fWorkloop ||
+            _fWorkloop->removeEventSource(_fCommandGate) != kIOReturnSuccess)) return false;
+        fLegacyCommandGateAdded = false;
+        OSSafeReleaseNULL(_fCommandGate);
+    }
+    OSSafeReleaseNULL(fHalService);
+    OSSafeReleaseNULL(fWatchdogWorkLoop);
+    OSSafeReleaseNULL(_fWorkloop);
+    return releaseControllerTimerReferences();
 }
 
 void itlwm::releaseAll()
 {
-    if (fHalService) {
-        fHalService->release();
-        fHalService = NULL;
-    }
-    if (_fWorkloop) {
-        if (_fCommandGate) {
-//            _fCommandGate->disable();
-            _fWorkloop->removeEventSource(_fCommandGate);
-            _fCommandGate->release();
-            _fCommandGate = NULL;
-        }
-        if (fWatchdogWorkLoop && watchdogTimer) {
-            watchdogTimer->cancelTimeout();
-            fWatchdogWorkLoop->removeEventSource(watchdogTimer);
-            watchdogTimer->release();
-            watchdogTimer = NULL;
-            fWatchdogWorkLoop->release();
-            fWatchdogWorkLoop = NULL;
-        }
-        _fWorkloop->release();
-        _fWorkloop = NULL;
-    }
-    unregistPM();
+    cleanupLegacy(getProvider());
 }
 
 void itlwm::free()
 {
+    if (!cleanupLegacy(getProvider(), true)) return;
     XYLog("%s\n", __FUNCTION__);
-    if (fHalService != NULL) {
-        fHalService->release();
-        fHalService = NULL;
+    if (fPowerCallLock) {
+        IOLockFree(fPowerCallLock);
+        fPowerCallLock = NULL;
+    }
+    if (fControllerTimerLock) {
+        IOLockFree(fControllerTimerLock);
+        fControllerTimerLock = NULL;
     }
     super::free();
 }
 
 IOReturn itlwm::enable(IONetworkInterface *netif)
 {
+    if (controllerTimersClosing()) return kIOReturnNotReady;
     XYLog("%s\n", __FUNCTION__);
     super::enable(netif);
     _fCommandGate->enable();
     fHalService->enable(netif);
-    watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
-    watchdogTimer->enable();
+    if (!armControllerWatchdog()) return kIOReturnNotReady;
     return kIOReturnSuccess;
 }
 
 IOReturn itlwm::disable(IONetworkInterface *netif)
 {
+    if (controllerTimersClosing()) return kIOReturnSuccess;
     XYLog("%s\n", __FUNCTION__);
     super::disable(netif);
     watchdogTimer->cancelTimeout();

@@ -1422,7 +1422,10 @@ iwm_clear_oactive(struct iwm_softc *sc, struct iwm_tx_ring *ring)
             (*ifp->if_start)(ifp);
         }
 #ifdef __PRIVATE_SPI__
-        ifp->iface->signalOutputThread();
+        if (ifp->native_output_ready)
+            ifp->native_output_ready(ifp->native_input_context);
+        else if (ifp->iface)
+            ifp->iface->signalOutputThread();
 #endif
     }
 }
@@ -4529,6 +4532,7 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
         return false;
     }
 
+    acquireInterruptSourceLease();
     if (sc->sc_msix)
         sc->sc_ih =
         IOFilterInterruptEventSource::filterInterruptEventSource(this,
@@ -4769,7 +4773,8 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
         goto fail4;
     }
     
-    taskq_init();
+    if (!taskq_init())
+        goto fail4;
     sc->sc_nswq = taskq_create("iwmns", 1, IPL_NET, 0);
     if (sc->sc_nswq == NULL)
         goto fail4;

@@ -438,7 +438,7 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         ni->ni_rstamp = rxi->rxi_tstamp;
         ni->ni_inact = 0;
         
-        if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bgscan_start) {
+        if (!ic->ic_native_controlled && ic->ic_state == IEEE80211_S_RUN && ic->ic_bgscan_start) {
             /* Cancel or start background scan based on RSSI. */
             if ((*ic->ic_node_checkrssi)(ic, ni))
                 timeout_del(&ic->ic_bgscan_timeout);
@@ -619,6 +619,8 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_IN);
 #endif
             
+            /* Count accepted data MPDUs by AC. */
+            ic->ic_wcl_rx_ac[ieee80211_up_to_ac(ic, hasqos ? tid : 0)]++;
             if ((ni->ni_flags & IEEE80211_NODE_HT) &&
                 hasqos && (qos & IEEE80211_QOS_AMSDU))
                 ieee80211_amsdu_decap(ic, m, ni, hdrlen, ml);
@@ -1136,8 +1138,14 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
             if (ieee80211_is_8021x_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
                 XYLog("%s Duplicate EAPOL packet to user space\n", __FUNCTION__);
                 mbuf_dup(m, MBUF_DONTWAIT, &m2);
-                if (m2 != NULL)
-                    ifp->iface->inputPacket(m2, mbuf_len(m2));
+                if (m2 != NULL) {
+                    if (ifp->native_input)
+                        ifp->native_input(ifp->native_input_context, m2);
+                    else if (ifp->iface)
+                        ifp->iface->inputPacket(m2, mbuf_len(m2));
+                    else
+                        mbuf_freem(m2);
+                }
             }
 #endif
             ieee80211_eapol_key_input(ic, m, ni);
@@ -1702,6 +1710,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     wh = mtod(m, struct ieee80211_frame *);
     frm = (const u_int8_t *)&wh[1];
     efrm = mtod(m, u_int8_t *) + mbuf_len(m);
+
+    /* Cache the last beacon of the associated BSS (getBEACON_INFO). */
+    if (!isprobe && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
+        IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid)) {
+        size_t blen = mbuf_len(m);
+        __atomic_add_fetch(&ic->ic_bcn_gen, 1, __ATOMIC_ACQ_REL);   /* odd: writing */
+        if (blen > sizeof(ic->ic_bcn_frame)) {
+            ic->ic_bcn_len = (uint32_t)blen;                         /* reported as too large */
+        } else {
+            memcpy(ic->ic_bcn_frame, wh, blen);
+            ic->ic_bcn_len = (uint32_t)blen;
+        }
+        __atomic_add_fetch(&ic->ic_bcn_gen, 1, __ATOMIC_ACQ_REL);   /* even: stable */
+    }
     
     tstamp  = frm; frm += 8;
     bintval = LE_READ_2(frm); frm += 2;
@@ -2120,6 +2142,14 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     ni->ni_erp = erp;
     /* NB: must be after ni_chan is setup */
     ieee80211_setup_rates(ic, ni, rates, xrates, IEEE80211_F_DOSORT);
+    if (ic->ic_native_controlled && ic->ic_event_handler) {
+        struct ieee80211_native_beacon_event event;
+        event.frame = m;
+        event.rxinfo = rxi;
+        event.channel = chan;
+        event.channel_flags = ni->ni_chan->ic_flags;
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_NATIVE_BEACON, &event);
+    }
 #ifndef IEEE80211_STA_ONLY
     if (ic->ic_opmode == IEEE80211_M_IBSS && is_new && isprobe) {
         /*
@@ -2276,6 +2306,26 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     }
     ic->ic_deauth_reason = IEEE80211_REASON_UNSPECIFIED;
     ic->ic_assoc_status = 0xffff;
+    // Retire this context before synchronous failure observers can replace it.
+    if (ic->ic_native_controlled && ic->ic_state == IEEE80211_S_AUTH && seq == 2 &&
+        status != IEEE80211_STATUS_SUCCESS &&
+        ieee80211_native_reassoc_context_matches(&ic->ic_native_reassoc,
+            ic->ic_native_join_generation, wh->i_addr3))
+        ieee80211_clear_native_reassoc(ic);
+    if (ic->ic_native_controlled && ic->ic_state == IEEE80211_S_AUTH && seq == 2 &&
+        status != IEEE80211_STATUS_SUCCESS) {
+        ic->ic_stats.is_rx_auth_fail++;
+        if (ic->ic_event_handler) {
+            struct ieee80211_native_join_event event;
+            event.generation = ic->ic_native_join_generation;
+            event.status = status;
+            IEEE80211_ADDR_COPY(event.bssid, wh->i_addr3);
+            (*ic->ic_event_handler)(ic, IEEE80211_EVT_NATIVE_JOIN_FAILURE, &event);
+        }
+        // WCL owns candidate selection and retries. Do not run auth_open's
+        // automatic BSS fallback or touch a successor after this callback.
+        return;
+    }
     ieee80211_auth_open(ic, wh, ni, rxi, seq, status);
 }
 
@@ -2664,13 +2714,19 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     status =  LE_READ_2(frm); frm += 2;
 
     ic->ic_assoc_status = status;
-    if (status == IEEE80211_STATUS_SUCCESS) {
-        if (ic->ic_event_handler) {
-            (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ASSOC_DONE, NULL);
-        }
-    }
-    
     if (status != IEEE80211_STATUS_SUCCESS) {
+        // Clear only this attempt, before an observer can install a successor.
+        if (ic->ic_native_controlled &&
+            ieee80211_native_reassoc_context_matches(&ic->ic_native_reassoc,
+                ic->ic_native_join_generation, wh->i_addr3))
+            ieee80211_clear_native_reassoc(ic);
+        if (ic->ic_native_controlled && ic->ic_event_handler) {
+            struct ieee80211_native_join_event event;
+            event.generation = ic->ic_native_join_generation;
+            event.status = status;
+            IEEE80211_ADDR_COPY(event.bssid, wh->i_addr3);
+            (*ic->ic_event_handler)(ic, IEEE80211_EVT_NATIVE_JOIN_FAILURE, &event);
+        }
         if (ifp->if_flags & IFF_DEBUG)
             XYLog("%s: %sassociation failed (status %d)"
                   " for %s\n", ifp->if_xname,
@@ -2844,6 +2900,14 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     
     ieee80211_new_state(ic, IEEE80211_S_RUN,
                         IEEE80211_FC0_SUBTYPE_ASSOC_RESP);
+    if (ic->ic_event_handler) {
+        struct ieee80211_native_join_event event;
+        event.generation = ic->ic_native_join_generation;
+        event.status = status;
+        IEEE80211_ADDR_COPY(event.bssid, wh->i_addr3);
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ASSOC_DONE,
+                               ic->ic_native_controlled ? &event : NULL);
+    }
 }
 
 /*-
@@ -2871,8 +2935,18 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
 
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
+    const uint64_t native_gen = ic->ic_native_join_generation;
+    /* Only frames from the current BSS may end the association (as the
+     * native event observer requires, AirportItlwmV2.cpp:3274). */
+    const int from_bss = ic->ic_bss != NULL &&
+        IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid);
     if (ic->ic_event_handler) {
-        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
+        struct ieee80211_native_join_event event;
+        event.generation = ic->ic_native_join_generation;
+        event.status = reason;
+        IEEE80211_ADDR_COPY(event.bssid, wh->i_addr3);
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH,
+                               ic->ic_native_controlled ? &event : NULL);
     }
     
     ic->ic_stats.is_rx_deauth++;
@@ -2884,7 +2958,19 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
             int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
                              ic->ic_state >= IEEE80211_S_AUTH);
-            if (!(roamscan || stay_auth))
+            /*
+             * Native (WCL-controlled) mode: Apple's driver only reports the
+             * deauth and leaves the reconnect decision to WCL
+             * (AppleBCMWLANCore::handleDeauthDisassocEvent). Do not retry AUTH
+             * on our own; drop to the idle SCAN state, like the local deauth
+             * path in ItlIwx. The observer may already have replaced this
+             * association, so act only if the join generation is unchanged.
+             */
+            if (ic->ic_native_controlled) {
+                if (from_bss && ic->ic_native_join_generation == native_gen &&
+                    ic->ic_state >= IEEE80211_S_ASSOC)
+                    ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+            } else if (!(roamscan || stay_auth))
                 ieee80211_new_state(ic, IEEE80211_S_AUTH,
                                     IEEE80211_FC0_SUBTYPE_DEAUTH);
         }
@@ -2936,6 +3022,18 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     reason = LE_READ_2(frm);
     
     XYLog("Disassoc received, reason %d\n", reason);
+    const uint64_t native_gen = ic->ic_native_join_generation;
+    /* Only frames from the current BSS may end the association (as the
+     * native event observer requires, AirportItlwmV2.cpp:3274). */
+    const int from_bss = ic->ic_bss != NULL &&
+        IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid);
+    if (ic->ic_native_controlled && ic->ic_event_handler) {
+        struct ieee80211_native_join_event event;
+        event.generation = ic->ic_native_join_generation;
+        event.status = reason;
+        IEEE80211_ADDR_COPY(event.bssid, wh->i_addr3);
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DISASSOC, &event);
+    }
     
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {
@@ -2944,7 +3042,12 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
                           ic->ic_state == IEEE80211_S_RUN);
             int roamscan = bgscan &&
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
-            if (!roamscan) /* ignore disassoc during bgscan */
+            /* Native mode: report only; WCL decides (see recv_deauth). */
+            if (ic->ic_native_controlled) {
+                if (from_bss && ic->ic_native_join_generation == native_gen &&
+                    ic->ic_state >= IEEE80211_S_ASSOC)
+                    ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+            } else if (!roamscan) /* ignore disassoc during bgscan */
                 ieee80211_new_state(ic, IEEE80211_S_ASSOC,
                                     IEEE80211_FC0_SUBTYPE_DISASSOC);
         }

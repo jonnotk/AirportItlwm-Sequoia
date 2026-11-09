@@ -1405,6 +1405,15 @@ ieee80211_end_scan(struct _ifnet *ifp)
     
     if (ic->ic_event_handler)
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_SCAN_DONE, NULL);
+
+    // WCL owns candidate selection and association. A HAL startup/cache scan
+    // must not start a separate automatic join or another scan behind WCL.
+    if (ic->ic_native_controlled) {
+        ic->ic_flags &= ~(IEEE80211_F_ASCAN | IEEE80211_F_BGSCAN |
+                          IEEE80211_F_DISABLE_BG_AUTO_CONNECT);
+        ic->ic_scan_count++;
+        return;
+    }
     
     if (ifp->if_flags & IFF_DEBUG)
         XYLog("%s: end %s scan\n", ifp->if_xname,
@@ -1690,8 +1699,18 @@ void
 ieee80211_node_copy(struct ieee80211com *ic,
                     struct ieee80211_node *dst, const struct ieee80211_node *src)
 {
+    const bool native_bss = ic->ic_native_controlled &&
+        ic->ic_opmode == IEEE80211_M_STA && dst == ic->ic_bss;
+    const u_int destination_refs = dst->ni_refcnt;
+    if (ic->ic_native_controlled && dst == ic->ic_bss)
+        ieee80211_clear_native_bss_keys(ic, src);
     ieee80211_node_cleanup(ic, dst);
     *dst = *src;
+    // TX descriptors still own references to this permanent allocation.
+    if (native_bss)
+        dst->ni_refcnt = destination_refs;
+    if (ic->ic_native_controlled && dst == ic->ic_bss)
+        ieee80211_reset_native_bss_security(ic, dst);
     dst->ni_rsnie = NULL;
     if (src->ni_rsnie != NULL)
         ieee80211_save_ie(src->ni_rsnie, &dst->ni_rsnie);
@@ -1740,7 +1759,7 @@ ieee80211_node_set_timeouts(struct ieee80211_node *ni)
 {
     int i;
     
-    memset(ni->ni_addba_req_to, 0, sizeof(ni->ni_addba_req_to) * nitems(ni->ni_addba_req_to));
+    memset(ni->ni_addba_req_to, 0, sizeof(ni->ni_addba_req_to));
 #ifndef IEEE80211_STA_ONLY
     timeout_set(&ni->ni_eapol_to, ieee80211_eapol_timeout, ni);
     timeout_set(&ni->ni_sa_query_to, ieee80211_sa_query_timeout, ni);
@@ -2077,6 +2096,14 @@ ieee80211_free_node(struct ieee80211com *ic, struct ieee80211_node *ni)
     DPRINTF(("%s %s %s\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid)));
     if (ni == ic->ic_bss)
         panic("freeing bss node");
+
+    // Native WCL can hold a cache reference across a gated configuration call.
+    // Keep the tree entry and storage until the last holder releases it. Both
+    // forced cleanup loops advance before calling us, so they do not spin here.
+    if (ic->ic_native_controlled && ni->ni_refcnt > 0) {
+        ni->ni_state = IEEE80211_STA_COLLECT;
+        return;
+    }
     
     splassert(IPL_NET);
     

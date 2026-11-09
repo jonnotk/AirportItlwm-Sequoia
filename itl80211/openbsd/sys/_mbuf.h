@@ -299,6 +299,17 @@ mq_purge(struct mbuf_queue *mq)
     return (ml_purge(&ml));
 }
 
+/* The caller has drained all producers and consumers before destruction. */
+static inline void
+mq_destroy(struct mbuf_queue *mq)
+{
+    if (!mq->mq_mtx)
+        return;
+    mq_purge(mq);
+    IORecursiveLockFree(mq->mq_mtx);
+    mq->mq_mtx = NULL;
+}
+
 /*
  * Concatenate mbuf chain n to m.
  * n might be copied into m (when n->m_len is small), therefore data portion of

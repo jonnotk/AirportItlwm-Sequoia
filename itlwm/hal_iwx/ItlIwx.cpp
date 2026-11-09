@@ -120,6 +120,7 @@
 #include <sys/_task.h>
 #include <sys/pcireg.h>
 #include <net80211/ieee80211_priv.h>
+#include <HAL/AiritlDebug.h>
 
 #define super ItlHalService
 OSDefineMetaClassAndStructors(ItlIwx, ItlHalService)
@@ -141,6 +142,39 @@ int iwx_debug = 1;
 
 bool ItlIwx::attach(IOPCIDevice *device)
 {
+    clearNativeCurrentRates();
+    nativeQuiescing = nativeStopInProgress = false;
+    nativeStopOwner = NULL;
+    nativeEnableAttempt = 0;
+    nativeEnablePending = false;
+    nativeEnableResult = kIOReturnNotReady;
+    nativeRecoverySequence = 0;
+    memset(&nativeRecovery, 0, sizeof(nativeRecovery));
+    nativeRecoveryStopOwner = NULL;
+    nativeRecoveryActive = nativeRecoveryInitFinished = nativeRecoveryNeedsQuiescence = false;
+    memset(nativeKeyInstalls, 0, sizeof(nativeKeyInstalls));
+    nativeKeyHardwareGeneration = 0;
+    nativeKeyJoinGeneration = 0;
+    memset(nativeKeyBssid, 0, sizeof(nativeKeyBssid));
+    nativeKeyFailed = nativeKeyPortRequested = false;
+
+    memset(nativeWaiters, 0, sizeof(nativeWaiters));
+    memset(&nativeScanProfile, 0, sizeof(nativeScanProfile));
+    nativeScanPending = nativeScanCancelled = nativeScanSubmitting = false;
+    nativeScanCompletion = NULL;
+    nativeScanContext = NULL;
+    nativeScanToken = nativeScanUID = 0;
+    firmwareScanFinalPending = false;
+    pnvmComplete = 0;
+    pnvmStatus = 0;
+    preinitComplete = false;
+    nativeMccPending = nativeMccRefreshing = nativeMccFailed = false;
+    nativeMccScanDeferred = false;
+    nativeMccHeSuspended = false;
+    nativeMccBusy = 0;
+    nativeMccSequence = 0;
+    com.sc_ic.ic_native_core_generation = 0;
+    memset(nativeMccRequested, 0, sizeof(nativeMccRequested));
     pci.pa_tag = device;
     pci.workloop = getMainWorkLoop();
     if (!iwx_attach(&com, &pci)) {
@@ -148,29 +182,114 @@ bool ItlIwx::attach(IOPCIDevice *device)
         releaseAll();
         return false;
     }
+    deviceAttachComplete = true;
+    return true;
+}
+
+bool ItlIwx::quiesceForDetach()
+{
+    if (detachQuiesced) {
+        if (taskq_is_current(systq) || taskq_is_current(com.sc_nswq)) {
+            quarantineTeardown();
+            return false;
+        }
+        return true;
+    }
+    if (!getMainWorkLoop() || !getMainCommandGate()) {
+        teardownStartedBeforeBinding();
+        bool pristine = !com.sc_st && !com.sc_ih && !deviceAttachComplete;
+        if (!pristine)
+            quarantineTeardown();
+        return pristine;
+    }
+    if (!getMainWorkLoop()->inGate())
+        return getMainCommandGate()->runAction(quiesceGated, static_cast<ItlHalService *>(this)) == kIOReturnSuccess;
+
+    struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    struct iwx_softc *sc = &com;
+
+
+    bool timerAdmissionClosed = beginTeardown();
+    nativeTaskAdmission(false);
+    // The task barrier excludes its caller, but final queue destruction cannot.
+    // A self-worker cleanup must leave its callback dependencies retained.
+    if (taskq_is_current(systq) || taskq_is_current(com.sc_nswq)) {
+        quarantineTeardown();
+        return false;
+    }
+    if (!timerAdmissionClosed) {
+        IOLog("itlwm: timer admission publication failed; retaining device resources\n");
+        return false;
+    }
+
+    if (getMainCommandGate()->runAction(CTimeout::quiesceControllerTimers) != kIOReturnSuccess) {
+        quarantineTeardown();
+        return false;
+    }
+    // Native stop also cancels a queued init when IFF_RUNNING was never set.
+    // Draining happens while the gate can still admit cancellation callbacks.
+    if (sc->sc_ic.ic_native_controlled && sc->sc_nswq) {
+        ifp->if_flags &= ~IFF_UP;
+        iwx_stop(ifp);
+    } else {
+        // Legacy firmware waiters still need IRQ completions while returning.
+        // Close every task producer before joining the admitted workers.
+        nativeTaskAdmission(false);
+        struct task *tasks[] = {&com.init_task, &com.newstate_task, &com.ba_task,
+            &com.mac_ctxt_task, &com.chan_ctxt_task, &nativeMccRefreshTask};
+        IOCommandGate *gate = getMainWorkLoop()->inGate() ? getMainCommandGate() : NULL;
+        for (unsigned i = 0; i < nitems(tasks); ++i)
+            taskq_del_barrier_gated(i == 1 ? com.sc_nswq : systq, tasks[i], gate);
+        // Failed low-level attaches already unwound their DMA after preinit stop.
+        if (deviceAttachComplete && com.sc_st)
+            iwx_stop_device(sc);
+    }
+    deviceAttachComplete = false;
+    if (!releaseInterruptSource(com.sc_ih))
+        return false;
+    finishNativeScan(kIOReturnAborted, 0);
+    detachQuiesced = true;
     return true;
 }
 
 void ItlIwx::
 detach(IOPCIDevice *device)
 {
+    if (detachComplete || !quiesceForDetach())
+        return;
+    if (!getMainWorkLoop() || !getMainCommandGate()) {
+        releaseAll();
+        detachComplete = true;
+        return;
+    }
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
     struct iwx_softc *sc = &com;
-    
+
     for (int txq_i = 0; txq_i < nitems(sc->txq); txq_i++)
         iwx_free_tx_ring(sc, &sc->txq[txq_i]);
     iwx_free_rx_ring(sc, &sc->rxq);
     iwx_dma_contig_free(&sc->ict_dma);
     iwx_dma_contig_free(&com.ctxt_info_dma);
     ieee80211_ifdetach(ifp);
+    for (unsigned i = 0; i < nitems(com.sc_rxba_data); ++i) {
+        timeout_free(&com.sc_rxba_data[i].session_timer);
+        timeout_free(&com.sc_rxba_data[i].reorder_buf.reorder_timer);
+    }
     taskq_destroy(systq);
     taskq_destroy(com.sc_nswq);
+    com.sc_nswq = NULL;
+    preinitComplete = false;
     releaseAll();
+    detachComplete = true;
 }
 
 void ItlIwx::
 releaseAll()
 {
+    if (isTearingDown() && teardownMustRetainResources())
+        return;
+    if (!releaseInterruptSource(com.sc_ih))
+        return;
     pci_intr_handle *intrHandler = com.ih;
     
     if (intrHandler) {
@@ -187,6 +306,12 @@ releaseAll()
         intrHandler->release();
         com.ih = NULL;
     }
+    // Callback and task users have drained before their BAR mapping goes away.
+    iwx_fw_info_free(&com.sc_fw);
+    iwx_pnvm_free(&com.sc_fw);
+    OSSafeReleaseNULL(com.sc_st);
+    com.sc_sh = NULL;
+    com.sc_sz = 0;
     pci.pa_tag = NULL;
     pci.workloop = NULL;
 }
@@ -194,6 +319,7 @@ releaseAll()
 void ItlIwx::free()
 {
     XYLog("%s\n", __FUNCTION__);
+    releaseAll();
     super::free();
 }
 
@@ -209,13 +335,152 @@ getDriverController()
     return this;
 }
 
+IOReturn ItlIwx::nativeExternalControlStatus(IOCommandGate *gate, IOWorkLoop *loop)
+{
+    if (!gate || !loop || !getMainCommandGate() || !getMainWorkLoop())
+        return kIOReturnNotReady;
+    if (gate != getMainCommandGate() || loop != getMainWorkLoop() ||
+        gate->getWorkLoop() != loop || !loop->inGate())
+        return kIOReturnNotPermitted;
+    if (taskq_is_current(systq) || taskq_is_current(com.sc_nswq) ||
+        nativeStopOwner == current_thread())
+        return kIOReturnBusy;
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::nativeRadioInputStatus(IOCommandGate *gate, IOWorkLoop *loop)
+{
+    IOReturn status = nativeExternalControlStatus(gate, loop);
+    if (status != kIOReturnSuccess) return status;
+    if (isTearingDown()) return kIOReturnAborted;
+    if (!deviceAttachComplete) return kIOReturnNotReady;
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::inspectNativeActivation(IOCommandGate *gate, IOWorkLoop *loop,
+    bool *accepted)
+{
+    if (!accepted) return kIOReturnBadArgument;
+    *accepted = false;
+    IOReturn status = nativeExternalControlStatus(gate, loop);
+    if (status != kIOReturnSuccess) return status;
+    if (isTearingDown()) return kIOReturnAborted;
+    if (!deviceAttachComplete) return kIOReturnNotReady;
+    const auto init = taskq_inspect_task(systq, &com.init_task);
+    const auto state = taskq_inspect_task(com.sc_nswq, &com.newstate_task);
+    if (!init.service || !state.service) return kIOReturnNotReady;
+    // Recovery retains its own completion and observer-reopening protocol.
+    if (nativeRecoveryActive) return kIOReturnNotReady;
+    const unsigned flags = com.sc_ic.ic_if.if_flags;
+    const bool open = !nativeStopInProgress && !nativeStopOwner &&
+        !nativeQuiescing && !(com.sc_flags & IWX_FLAG_SHUTDOWN);
+    const bool pending = nativeEnableAttempt && nativeEnablePending &&
+        (flags & IFF_UP) && open && !init.suspended &&
+        (init.pending || init.active);
+    const bool running = nativeEnableAttempt && !nativeEnablePending &&
+        nativeEnableResult == kIOReturnSuccess && open &&
+        (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING);
+    *accepted = pending || running;
+    return kIOReturnSuccess;
+}
+
+bool ItlIwx::nativeActivationDrained()
+{
+    if (!getMainWorkLoop() || !getMainWorkLoop()->inGate() ||
+        isTearingDown() || !deviceAttachComplete || nativeStopInProgress ||
+        nativeStopOwner || !nativeQuiescing || nativeEnablePending ||
+        !(com.sc_flags & IWX_FLAG_SHUTDOWN) ||
+        (com.sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING))) return false;
+    struct task *tasks[] = {&com.init_task, &com.newstate_task, &com.ba_task,
+        &com.mac_ctxt_task, &com.chan_ctxt_task, &nativeMccRefreshTask};
+    for (unsigned i = 0; i < nitems(tasks); ++i) {
+        const auto state = taskq_inspect_task(i == 1 ? com.sc_nswq : systq, tasks[i]);
+        if (!state.service || !state.suspended || state.pending || state.active)
+            return false;
+    }
+    for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+        if (nativeWaiters[i].thread) return false;
+    return true;
+}
+
+void ItlIwx::completeNativeAdmissionError(uint64_t attempt, IOReturn result)
+{
+    // Only the unyielded, drained preparation phase may publish while quiesced.
+    if (!getMainWorkLoop() || !getMainWorkLoop()->inGate() || isTearingDown() ||
+        result == kIOReturnSuccess || !attempt || attempt != nativeEnableAttempt ||
+        !nativeEnablePending || nativeStopInProgress || nativeStopOwner || !nativeQuiescing ||
+        !(com.sc_flags & IWX_FLAG_SHUTDOWN) ||
+        (com.sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) != IFF_UP) return;
+    struct task *tasks[] = {&com.init_task, &com.newstate_task, &com.ba_task,
+        &com.mac_ctxt_task, &com.chan_ctxt_task, &nativeMccRefreshTask};
+    for (unsigned i = 0; i < nitems(tasks); ++i) {
+        const auto state = taskq_inspect_task(i == 1 ? com.sc_nswq : systq, tasks[i]);
+        if (!state.service || !state.suspended || state.pending || state.active) return;
+    }
+    for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+        if (nativeWaiters[i].thread) return;
+    nativeEnableResult = result;
+    nativeEnablePending = false;
+    getMainCommandGate()->commandWakeup(&nativeEnableAttempt, false);
+}
+
 IOReturn ItlIwx::enable(IONetworkInterface *netif)
 {
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    if (com.sc_ic.ic_native_controlled && isTearingDown()) return kIOReturnAborted;
+#endif
+    if (isTearingDown() || !getMainWorkLoop() || !deviceAttachComplete)
+        return kIOReturnNotReady;
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    if (com.sc_ic.ic_native_controlled) {
+        bool accepted = false;
+        IOReturn status = inspectNativeActivation(getMainCommandGate(), getMainWorkLoop(), &accepted);
+        if (status != kIOReturnSuccess) return status;
+        if (accepted) return kIOReturnSuccess;
+        if (!nativeActivationDrained()) return kIOReturnNotReady;
+        if (!++nativeEnableAttempt) ++nativeEnableAttempt;
+        const uint64_t attempt = nativeEnableAttempt;
+        nativeEnablePending = true;
+        nativeEnableResult = kIOReturnNotReady;
+        ifp->if_flags |= IFF_UP;
+        const int error = iwx_resume(&com);
+        if (error) {
+            XYLog("%s: could not initialize hardware, error %d\n", DEVNAME(&com), error);
+            status = error == ETIMEDOUT ? kIOReturnTimeout : kIOReturnError;
+        } else if (!iwx_set_hw_ready(&com)) status = kIOReturnTimeout;
+        if (status != kIOReturnSuccess) {
+            completeNativeAdmissionError(attempt, status);
+            return status;
+        }
+        nativeQuiescing = false;
+        com.sc_flags &= ~IWX_FLAG_SHUTDOWN;
+        nativeTaskAdmission(true);
+        struct taskq_task_status queue;
+        if (taskq_add_checked(systq, &com.init_task, &queue) == TASKQ_REFUSED) {
+            status = isTearingDown() ? kIOReturnAborted : kIOReturnNotReady;
+            completeNativeEnable(attempt, status);
+            return status;
+        }
+        return kIOReturnSuccess;
+    }
+#endif
+    if (com.sc_ic.ic_native_controlled) {
+        if (nativeStopInProgress)
+            return kIOReturnBusy;
+        nativeQuiescing = false;
+        com.sc_flags &= ~IWX_FLAG_SHUTDOWN;
+        nativeTaskAdmission(true);
+    }
     if (ifp->if_flags & IFF_UP) {
         XYLog("%s already in activating state\n", __FUNCTION__);
         return kIOReturnSuccess;
+    }
+    if (com.sc_ic.ic_native_controlled) {
+        if (!++nativeEnableAttempt) ++nativeEnableAttempt;
+        nativeEnablePending = true;
+        nativeEnableResult = kIOReturnNotReady;
     }
     ifp->if_flags |= IFF_UP;
     iwx_activate(&com, DVACT_RESUME);
@@ -227,6 +492,19 @@ IOReturn ItlIwx::disable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    if (com.sc_ic.ic_native_controlled) {
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+        IOReturn status = nativeExternalControlStatus(getMainCommandGate(), getMainWorkLoop());
+        if (status != kIOReturnSuccess) return status;
+#endif
+        // The public completion contract includes every HAL worker. Internal
+        // recovery uses iwx_stop directly and has a separate self exclusion.
+        if (taskq_is_current(systq) || taskq_is_current(com.sc_nswq))
+            return kIOReturnBusy;
+        ifp->if_flags &= ~IFF_UP;
+        iwx_stop(ifp);
+        return kIOReturnSuccess;
+    }
     if (!(ifp->if_flags & IFF_UP)) {
         XYLog("%s already in diactivating state\n", __FUNCTION__);
         return kIOReturnSuccess;
@@ -236,10 +514,529 @@ IOReturn ItlIwx::disable(IONetworkInterface *netif)
     return kIOReturnSuccess;
 }
 
+IOReturn ItlIwx::nativeTaskGated(OSObject *, void *arg, void *, void *, void *)
+{
+    NativeTaskCall *call = static_cast<NativeTaskCall *>(arg);
+    if (call->hal->nativeQuiescing)
+        return kIOReturnAborted;
+    call->function(call->argument);
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::nativeStopGated(OSObject *, void *arg, void *, void *, void *)
+{
+    ItlIwx *hal = static_cast<ItlIwx *>(arg);
+    hal->iwx_stop(&hal->com.sc_ic.ic_if);
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::nativeDetachGated(OSObject *, void *arg, void *device, void *, void *)
+{
+    static_cast<ItlIwx *>(arg)->detach(static_cast<IOPCIDevice *>(device));
+    return kIOReturnSuccess;
+}
+
+void ItlIwx::nativeTaskDispatch(void *arg, void (*function)(void *))
+{
+    struct iwx_softc *sc = static_cast<struct iwx_softc *>(arg);
+    ItlIwx *hal = container_of(sc, ItlIwx, com);
+    if (!sc->sc_ic.ic_native_controlled) {
+        function(arg);
+        return;
+    }
+    NativeTaskCall call = {hal, function, arg};
+    // taskq records ownership before this gate acquisition, including workers
+    // blocked here. Stop cannot reopen admission until those frames leave.
+    hal->getMainCommandGate()->runAction(nativeTaskGated, &call);
+}
+
+void ItlIwx::nativeInitTask(void *arg) { nativeTaskDispatch(arg, iwx_init_task); }
+void ItlIwx::nativeNewstateTask(void *arg) { nativeTaskDispatch(arg, iwx_newstate_task); }
+void ItlIwx::nativeBATask(void *arg) { nativeTaskDispatch(arg, iwx_ba_task); }
+void ItlIwx::nativeMacTask(void *arg) { nativeTaskDispatch(arg, iwx_mac_ctxt_task); }
+void ItlIwx::nativeChanTask(void *arg) { nativeTaskDispatch(arg, iwx_chan_ctxt_task); }
+void ItlIwx::nativeMccTaskEntry(void *arg) { nativeTaskDispatch(arg, iwx_mcc_task); }
+
+void ItlIwx::nativeTaskAdmission(bool admit)
+{
+    if (admit && isTearingDown())
+        return;
+    struct task *tasks[] = {&com.init_task, &com.newstate_task, &com.ba_task,
+        &com.mac_ctxt_task, &com.chan_ctxt_task, &nativeMccRefreshTask};
+    for (unsigned i = 0; i < nitems(tasks); ++i) {
+        struct taskq *queue = i == 1 ? com.sc_nswq : systq;
+        if (admit)
+            taskq_resume_task(queue, tasks[i]);
+        else
+            taskq_suspend_task(queue, tasks[i]);
+    }
+}
+
+void ItlIwx::nativeDrainTasks()
+{
+    struct task *tasks[] = {&com.init_task, &com.newstate_task, &com.ba_task,
+        &com.mac_ctxt_task, &com.chan_ctxt_task, &nativeMccRefreshTask};
+    for (unsigned i = 0; i < nitems(tasks); ++i)
+        taskq_del_barrier_gated(i == 1 ? com.sc_nswq : systq,
+            tasks[i], getMainCommandGate());
+    // Key installation and other synchronous gated callers can sleep without
+    // owning a taskq frame. Their cancellation must return under this gate
+    // before stop may reset command buffers or acknowledge quiescence.
+    for (;;) {
+        bool waiting = false;
+        for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+            waiting |= nativeWaiters[i].thread &&
+                nativeWaiters[i].thread != current_thread();
+        if (!waiting)
+            break;
+        AbsoluteTime deadline;
+        clock_interval_to_deadline(10, kMillisecondScale,
+            reinterpret_cast<uint64_t *>(&deadline));
+        getMainCommandGate()->commandSleep(nativeWaiters, deadline, THREAD_UNINT);
+    }
+}
+
+int ItlIwx::tsleep_nsec(void *event, int priority, const char *message, int timeout)
+{
+    if (!com.sc_ic.ic_native_controlled)
+        return super::tsleep_nsec(event, priority, message, timeout);
+    if (!getMainWorkLoop()->inGate() || nativeQuiescing)
+        return ENXIO;
+    unsigned slot;
+    for (slot = 0; slot < nitems(nativeWaiters); ++slot)
+        if (!nativeWaiters[slot].thread)
+            break;
+    if (slot == nitems(nativeWaiters))
+        return EBUSY;
+    int generation = com.sc_generation;
+    nativeWaiters[slot].thread = current_thread();
+    nativeWaiters[slot].event = event;
+    // Firmware waits are bounded even for the historical INFSLP caller. Stop
+    // wakes every registered event and cancellation wins over a normal wakeup.
+    AbsoluteTime deadline;
+    uint32_t interval = timeout > 0 ? static_cast<uint32_t>(timeout) : 1000000000U;
+    clock_interval_to_deadline(interval, kNanosecondScale,
+        reinterpret_cast<uint64_t *>(&deadline));
+    IOReturn result = getMainCommandGate()->commandSleep(event, deadline, THREAD_UNINT);
+    nativeWaiters[slot].thread = NULL;
+    nativeWaiters[slot].event = NULL;
+    getMainCommandGate()->commandWakeup(nativeWaiters, false);
+    if (nativeQuiescing || generation != com.sc_generation)
+        return ENXIO;
+    return result == THREAD_AWAKENED ? 0 : ETIMEDOUT;
+}
+
+void ItlIwx::publishNativeCoreState(struct iwx_softc *sc, uint32_t state,
+    int status)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    if (!ic->ic_native_controlled || !getMainWorkLoop()->inGate() ||
+        !ic->ic_native_core_generation || !ic->ic_event_handler)
+        return;
+    struct ieee80211_native_core_event event = {
+        ic->ic_native_core_generation, state, status
+    };
+    (*ic->ic_event_handler)(ic, IEEE80211_EVT_NATIVE_CORE_STATE, &event);
+}
+
+uint64_t ItlIwx::beginNativeRecovery()
+{
+    if (!com.sc_ic.ic_native_controlled || !getMainWorkLoop()->inGate() ||
+        nativeStopInProgress || !(com.sc_ic.ic_if.if_flags & IFF_RUNNING))
+        return 0;
+    cancelNativeRecovery(kIOReturnAborted);
+    if (nativeRecoveryActive) return 0;
+    if (!++nativeRecoverySequence) ++nativeRecoverySequence;
+    memset(&nativeRecovery, 0, sizeof(nativeRecovery));
+    nativeRecovery.identity = nativeRecoverySequence;
+    nativeRecovery.origin_core_generation = com.sc_ic.ic_native_core_generation;
+    nativeRecovery.origin_hardware_generation = com.sc_generation;
+    nativeRecoveryStopOwner = current_thread();
+    nativeRecoveryActive = nativeRecoveryNeedsQuiescence = true;
+    nativeRecoveryInitFinished = false;
+    const uint64_t identity = nativeRecovery.identity;
+    publishNativeRecovery(IEEE80211_NATIVE_RESET_BEGIN, kIOReturnSuccess);
+    return nativeRecoveryActive && nativeRecovery.identity == identity ? identity : 0;
+}
+
+void ItlIwx::publishNativeRecovery(uint32_t state, IOReturn status)
+{
+    if (!nativeRecovery.identity || !getMainWorkLoop()->inGate()) return;
+    nativeRecovery.generation = com.sc_ic.ic_native_core_generation;
+    nativeRecovery.hardware_generation = com.sc_generation;
+    nativeRecovery.state = state;
+    nativeRecovery.status = status;
+    struct ieee80211_native_reset_event event = nativeRecovery;
+    if (com.sc_ic.ic_event_handler)
+        (*com.sc_ic.ic_event_handler)(&com.sc_ic,
+            IEEE80211_EVT_NATIVE_RESET_STATE, &event);
+}
+
+void ItlIwx::cancelNativeRecovery(IOReturn status)
+{
+    if (!nativeRecoveryActive) return;
+    // Retire before dispatch. A callback may create a successor reset.
+    nativeRecoveryActive = nativeRecoveryInitFinished = false;
+    nativeRecoveryStopOwner = NULL;
+    publishNativeRecovery(IEEE80211_NATIVE_RESET_CANCELLED, status);
+}
+
+void ItlIwx::tryCompleteNativeRecovery()
+{
+    if (!nativeRecoveryActive || !nativeRecoveryInitFinished ||
+        nativeRecovery.state != IEEE80211_NATIVE_RESET_RELOADING) return;
+    if (nativeMccFailed) {
+        cancelNativeRecovery(kIOReturnError);
+        return;
+    }
+    if (nativeRecovery.enable_attempt != nativeEnableAttempt ||
+        nativeRecovery.reload_generation != com.sc_ic.ic_native_core_generation ||
+        nativeRecovery.hardware_generation != com.sc_generation ||
+        nativeQuiescing || nativeStopInProgress ||
+        !(com.sc_ic.ic_if.if_flags & IFF_UP) ||
+        !(com.sc_ic.ic_if.if_flags & IFF_RUNNING) ||
+        nativeEnableResult != kIOReturnSuccess) {
+        cancelNativeRecovery(kIOReturnAborted);
+        return;
+    }
+    if (nativeEnablePending || !nativeRegulatoryReady()) return;
+    nativeRecoveryActive = nativeRecoveryInitFinished = false;
+    nativeRecoveryStopOwner = NULL;
+    publishNativeRecovery(IEEE80211_NATIVE_RESET_COMPLETE, kIOReturnSuccess);
+}
+
+int ItlIwx::iwx_wait_fw_state(struct iwx_softc *sc, void *event,
+    const volatile int *state, int mask, int expected, uint64_t timeout)
+{
+    uint64_t deadline, duration;
+    nanoseconds_to_absolutetime(timeout, &duration);
+    clock_get_uptime(&deadline);
+    deadline += duration;
+    const int generation = sc->sc_generation;
+    for (;;) {
+        // Cancellation wins even if the notification arrived in this wakeup.
+        if (generation != sc->sc_generation ||
+            (sc->sc_ic.ic_native_controlled && nativeQuiescing))
+            return ENXIO;
+        if (state ? ((*state & mask) == expected) :
+            sc->sc_ic.ic_state == expected)
+            return 0;
+        uint64_t now, remaining;
+        clock_get_uptime(&now);
+        if (now >= deadline)
+            return ETIMEDOUT;
+        absolutetime_to_nanoseconds(deadline - now, &remaining);
+        // Legacy attach uses a separate sleep lock. A notification between
+        // the predicate check and sleep must not become a full timeout.
+        const int interval = static_cast<int>(MIN(remaining, 10000000ULL));
+        int err = tsleep_nsec(event, 0, "iwxfwstate", MAX(interval, 1));
+        if (err && err != ETIMEDOUT && err != EWOULDBLOCK)
+            return err;
+    }
+}
+
+void ItlIwx::wakeupOn(void *event)
+{
+    if (com.sc_ic.ic_native_controlled)
+        getMainCommandGate()->commandWakeup(event, false);
+    super::wakeupOn(event);
+}
+
 void ItlIwx::
 clearScanningFlags()
 {
     com.sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+}
+
+void ItlIwx::completeNativeEnable(uint64_t attempt, IOReturn result)
+{
+    if (!nativeEnablePending || attempt != nativeEnableAttempt ||
+        nativeQuiescing || nativeStopInProgress)
+        return;
+    nativeEnableResult = result;
+    nativeEnablePending = false;
+    getMainCommandGate()->commandWakeup(&nativeEnableAttempt, false);
+}
+
+IOReturn ItlIwx::nativeWaitUntilReady(uint64_t timeout,
+    const uint64_t *identity, uint64_t expectedIdentity)
+{
+    if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
+    if (!com.sc_ic.ic_native_controlled) return kIOReturnUnsupported;
+    if (!identity || *identity != expectedIdentity) return kIOReturnAborted;
+    if (nativeStopInProgress) return kIOReturnAborted;
+    // Preserve pre-enable staging policy. The setter keeps its firmware
+    // ownership guards; this return does not claim a running radio.
+    if (!(com.sc_ic.ic_if.if_flags & IFF_UP) && !nativeEnablePending)
+        return kIOReturnSuccess;
+    const uint64_t attempt = nativeEnableAttempt;
+    unsigned slot;
+    for (slot = 0; slot < nitems(nativeWaiters); ++slot)
+        if (!nativeWaiters[slot].thread) break;
+    if (slot == nitems(nativeWaiters)) return kIOReturnBusy;
+    nativeWaiters[slot].thread = current_thread();
+    nativeWaiters[slot].event = &nativeEnableAttempt;
+    uint64_t deadline, duration;
+    nanoseconds_to_absolutetime(timeout, &duration);
+    clock_get_uptime(&deadline);
+    deadline += duration;
+    IOReturn result;
+    for (;;) {
+        if (*identity != expectedIdentity || attempt != nativeEnableAttempt ||
+            nativeQuiescing || nativeStopInProgress ||
+            !(com.sc_ic.ic_if.if_flags & IFF_UP)) {
+            result = kIOReturnAborted; break;
+        }
+        if (!nativeEnablePending && nativeEnableResult != kIOReturnSuccess) {
+            result = nativeEnableResult; break;
+        }
+        if (nativeMccFailed) { result = kIOReturnNotReady; break; }
+        bool otherWaiter = false;
+        for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+            otherWaiter |= i != slot && nativeWaiters[i].thread;
+        if (!nativeEnablePending && nativeRegulatoryReady() && !otherWaiter &&
+            (com.sc_ic.ic_if.if_flags & IFF_RUNNING)) {
+            result = kIOReturnSuccess; break;
+        }
+        uint64_t now;
+        clock_get_uptime(&now);
+        if (now >= deadline) { result = kIOReturnTimeout; break; }
+        uint64_t interval;
+        nanoseconds_to_absolutetime(10000000ULL, &interval);
+        const uint64_t next = deadline - now < interval ? deadline : now + interval;
+        AbsoluteTime wakeDeadline;
+        *reinterpret_cast<uint64_t *>(&wakeDeadline) = next;
+        getMainCommandGate()->commandSleep(&nativeEnableAttempt,
+            wakeDeadline, THREAD_UNINT);
+    }
+    nativeWaiters[slot].thread = NULL;
+    nativeWaiters[slot].event = NULL;
+    getMainCommandGate()->commandWakeup(nativeWaiters, false);
+    return result;
+}
+
+IOReturn ItlIwx::nativeSetHardwareAddress(const uint8_t *address)
+{
+    if (!getMainWorkLoop()->inGate())
+        return kIOReturnNotPermitted;
+    if (!address || !iwx_is_valid_mac_addr(address))
+        return kIOReturnBadArgument;
+    struct ieee80211com *ic = &com.sc_ic;
+    struct _ifnet *ifp = IC2IFP(ic);
+    uint8_t *current = reinterpret_cast<struct arpcom *>(ifp)->ac_enaddr;
+    if (!ic->ic_native_controlled)
+        return kIOReturnUnsupported;
+    if (IEEE80211_ADDR_EQ(address, current) &&
+        IEEE80211_ADDR_EQ(address, ic->ic_myaddr))
+        return kIOReturnSuccess;
+    if (nativeMccBusy && ic->ic_state <= IEEE80211_S_SCAN &&
+        com.ns_nstate <= IEEE80211_S_SCAN) {
+        int error = iwx_wait_fw_state(&com, &nativeMccBusy,
+            &nativeMccBusy, ~0, 0, 2000000000ULL);
+        if (error)
+            return error == ENXIO ? kIOReturnAborted : kIOReturnTimeout;
+    }
+    if (!nativeRegulatoryReady())
+        return kIOReturnNotReady;
+    if (!preinitComplete ||
+        !isset(com.sc_ucode_api, IWX_UCODE_TLV_API_REDUCED_SCAN_CONFIG))
+        return kIOReturnNotReady;
+    if (nativeQuiescing || nativeStopInProgress || nativeScanPending ||
+        firmwareScanFinalPending || ic->ic_state > IEEE80211_S_SCAN ||
+        com.ns_nstate > IEEE80211_S_SCAN ||
+        ((ifp->if_flags & IFF_UP) && !(ifp->if_flags & IFF_RUNNING)) ||
+        (com.sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN |
+            IWX_FLAG_MAC_ACTIVE | IWX_FLAG_BINDING_ACTIVE | IWX_FLAG_STA_ACTIVE |
+            IWX_FLAG_TE_ACTIVE | IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        return kIOReturnBusy;
+    for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+        if (nativeWaiters[i].thread)
+            return kIOReturnBusy;
+    // Before AUTH there is no station MAC context to reprogram. Reduced scan
+    // requests carry their own probe header. The next AUTH adds a fresh MAC
+    // context from ic_myaddr, so staging here preserves cached AP candidates.
+    IEEE80211_ADDR_COPY(current, address);
+    IEEE80211_ADDR_COPY(ic->ic_myaddr, address);
+    return kIOReturnSuccess;
+}
+
+bool ItlIwx::nativeScanInitializationReady() const
+{
+    // completeNativeEnable publishes success only for the current attempt,
+    // after iwx_init returns from its required initial SCAN transition.
+    return com.sc_ic.ic_native_controlled && nativeEnableAttempt &&
+        !nativeEnablePending && nativeEnableResult == kIOReturnSuccess &&
+        !nativeQuiescing && !nativeStopInProgress &&
+        (com.sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING) &&
+        nativeRegulatoryReady();
+}
+
+IOReturn ItlIwx::startNativeScan(const ItlNativeScanProfile &profile,
+                                    ItlNativeScanCompletion completion,
+                                    void *context)
+{
+    if (!getMainWorkLoop()->inGate())
+        return kIOReturnNotPermitted;
+    if (!completion || !itlNativeScanProfileValid(profile))
+        return kIOReturnBadArgument;
+    if (!nativeScanInitializationReady())
+        return kIOReturnNotReady;
+    if (!nativeRegulatoryReady())
+        return kIOReturnBusy;
+    if (nativeScanPending || firmwareScanFinalPending ||
+        (com.sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)))
+        return kIOReturnBusy;
+    if ((com.sc_ic.ic_if.if_flags & IFF_RUNNING) == 0 ||
+        (com.sc_flags & IWX_FLAG_SHUTDOWN))
+        return kIOReturnNotReady;
+    uint8_t version = iwx_lookup_cmd_ver(&com, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
+    const bool background = profile.background || com.sc_ic.ic_state == IEEE80211_S_RUN;
+    const uint16_t activeDwell = profile.activeDwell ? profile.activeDwell : 10;
+    const uint16_t passiveDwell = profile.passiveDwell ? profile.passiveDwell : 110;
+    if (activeDwell > passiveDwell)
+        return kIOReturnBadArgument;
+    // Keep a connected scan within the established 120-TU off-channel limit.
+    // Intel's RRM producer rejects dwell beyond its selected max_out_time.
+    if (background && (profile.activeDwell >= 120 || profile.passiveDwell >= 120))
+        return kIOReturnUnsupported;
+
+    unsigned count = 0;
+    const bool explicitChannels = itlNativeScanHasChannels(profile);
+    for (unsigned ch = 1; ch <= IEEE80211_CHAN_MAX; ++ch) {
+        if (!itlNativeScanSelectsChannel(profile, ch))
+            continue;
+        const ieee80211_channel *c = &com.sc_ic.ic_channels[ch];
+        const bool available = c->ic_flags &&
+            (IEEE80211_IS_CHAN_2GHZ(c) || IEEE80211_IS_CHAN_5GHZ(c));
+        if (!available) {
+            if (explicitChannels)
+                return kIOReturnUnsupported;
+            continue;
+        }
+        ++count;
+    }
+    if (!count || count > com.sc_capa_n_scan_channels ||
+        ((version == 12 || version == 14) && count > IWX_SCAN_MAX_NUM_CHANS_V3))
+        return kIOReturnNoSpace;
+
+    nativeScanProfile = profile;
+    nativeScanProfile.background = background;
+    nativeScanToken = profile.token;
+    nativeScanCompletion = completion;
+    nativeScanContext = context;
+    // Intel's current scan implementation uses UID as a firmware scan-slot
+    // index. This HAL owns one slot and does not issue another scan until the
+    // final notification drains it. The copied host token identifies clients.
+    nativeScanUID = 0;
+    nativeScanCancelled = false;
+    nativeScanPending = true;
+    nativeScanSubmitting = true;
+    com.sc_flags |= IWX_FLAG_BGSCAN;
+    int error = iwx_umac_scan(&com, background);
+    nativeScanSubmitting = false;
+    if (error) {
+        nativeScanPending = false;
+        nativeScanCompletion = NULL;
+        nativeScanContext = NULL;
+        memset(&nativeScanProfile, 0, sizeof(nativeScanProfile));
+        com.sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+        return error == ENOMEM ? kIOReturnNoMemory : kIOReturnError;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::cancelNativeScan(uint64_t token)
+{
+    if (!getMainWorkLoop()->inGate())
+        return kIOReturnNotPermitted;
+    if (!nativeScanPending || nativeScanToken != token)
+        return kIOReturnNotFound;
+
+    struct iwx_umac_scan_abort cmd = {};
+    cmd.uid = htole32(nativeScanUID);
+    // This small async command copies its payload without sleeping on the
+    // gate. Commit cancellation only after the transport accepts the abort.
+    // A rejected enqueue must leave the running scan and its profile intact.
+    if (iwx_send_cmd_pdu(&com,
+            IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_ABORT_UMAC),
+            IWX_CMD_ASYNC, sizeof(cmd), &cmd) != 0)
+        return kIOReturnError;
+
+    nativeScanCancelled = true;
+    memset(&nativeScanProfile, 0, sizeof(nativeScanProfile));
+    // Keep the request identity until final completion. A queued abort command
+    // is not evidence that firmware has stopped scanning.
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::nativeSoftLeave(uint64_t timeout)
+{
+    if (!getMainWorkLoop()->inGate())
+        return kIOReturnNotPermitted;
+    struct ieee80211com *ic = &com.sc_ic;
+    struct _ifnet *ifp = &ic->ic_ac.ac_if;
+    if (!ic->ic_native_controlled)
+        return kIOReturnUnsupported;
+    // A HAL worker must not wait for the newstate task it may be running.
+    if (taskq_is_current(systq) || taskq_is_current(com.sc_nswq))
+        return kIOReturnBusy;
+    if (nativeQuiescing || nativeStopInProgress || nativeEnablePending ||
+        nativeEnableResult != kIOReturnSuccess || !preinitComplete ||
+        (ifp->if_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) ||
+        (com.sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        return kIOReturnNotReady;
+    const int generation = com.sc_generation;
+    if (ic->ic_state != IEEE80211_S_SCAN || com.ns_nstate != IEEE80211_S_SCAN) {
+        AIRITL_DBG("%s: %s -> SCAN (no firmware restart)\n", __FUNCTION__,
+              ieee80211_state_name[ic->ic_state]);
+        ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+    }
+    // The native SCAN branch of iwx_newstate_task sets ic_state last, after
+    // run_stop/deauth removed the firmware station. A task error queues
+    // init_task, whose recovery changes sc_generation (ENXIO here).
+    int err = iwx_wait_fw_state(&com, &ic->ic_state, NULL, ~0,
+                                IEEE80211_S_SCAN, timeout);
+    if (err)
+        return err == ENXIO ? kIOReturnAborted : kIOReturnTimeout;
+    if (generation != com.sc_generation || nativeQuiescing || nativeStopInProgress ||
+        com.ns_nstate != IEEE80211_S_SCAN || !(ifp->if_flags & IFF_RUNNING) ||
+        (com.sc_flags & (IWX_FLAG_MAC_ACTIVE | IWX_FLAG_BINDING_ACTIVE |
+            IWX_FLAG_STA_ACTIVE | IWX_FLAG_TE_ACTIVE | IWX_FLAG_SHUTDOWN |
+            IWX_FLAG_HW_ERR)) ||
+        nativeKeyInstallPending())
+        return kIOReturnNotReady;
+    return kIOReturnSuccess;
+}
+
+void ItlIwx::finishNativeScan(IOReturn status, uint8_t firmwareStatus)
+{
+    nativeMccScanDeferred = false;
+    if (!nativeScanPending)
+        return;
+    ItlNativeScanCompletion completion = nativeScanCompletion;
+    void *context = nativeScanContext;
+    const uint64_t token = nativeScanToken;
+    nativeScanPending = false;
+    nativeScanCancelled = false;
+    nativeScanCompletion = NULL;
+    nativeScanContext = NULL;
+    nativeScanToken = 0;
+    nativeScanUID = 0;
+    memset(&nativeScanProfile, 0, sizeof(nativeScanProfile));
+    com.sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+    if (completion)
+        completion(context, token, status, firmwareStatus);
+}
+
+void ItlIwx::fillNativeScanSSIDs(struct iwx_ssid_ie *ssids)
+{
+    for (unsigned i = 0; i < nativeScanSSIDCount(); ++i) {
+        ssids[i].id = IEEE80211_ELEMID_SSID;
+        ssids[i].len = i < nativeScanProfile.ssidCount ?
+            nativeScanProfile.ssids[i].len : 0;
+        if (ssids[i].len)
+            memcpy(ssids[i].ssid, nativeScanProfile.ssids[i].bytes, ssids[i].len);
+    }
 }
 
 IOReturn ItlIwx::
@@ -323,6 +1120,13 @@ getTxNSS()
 {
     return iwx_mimo_enabled(&com) && 
     (com.sc_ic.ic_bss != NULL && com.sc_ic.ic_bss->ni_rx_nss > 1) ? 2 : 1;
+}
+
+// BT coex SMPS (iwx_bt_coex_eval_smps) limits the link to one stream.
+int ItlIwx::
+getBtCoexMaxNSS()
+{
+    return com.sc_bt_smps_applied != IWX_BT_SMPS_OFF ? 1 : getTxNSS();
 }
 
 struct ieee80211com *ItlIwx::
@@ -1382,8 +2186,11 @@ iwx_read_firmware(struct iwx_softc *sc)
     if (fw->fw_status == IWX_FW_STATUS_DONE)
         return 0;
     
-    while (fw->fw_status == IWX_FW_STATUS_INPROGRESS)
-        tsleep_nsec(&sc->sc_fw, 0, "iwxfwp", INFSLP);
+    while (fw->fw_status == IWX_FW_STATUS_INPROGRESS) {
+        int waitError = tsleep_nsec(&sc->sc_fw, 0, "iwxfwp", INFSLP);
+        if (sc->sc_ic.ic_native_controlled && waitError)
+            return waitError;
+    }
     fw->fw_status = IWX_FW_STATUS_INPROGRESS;
     
     if (fw->fw_rawdata != NULL)
@@ -1415,7 +2222,16 @@ iwx_read_firmware(struct iwx_softc *sc)
     }
     fw->fw_rawsize = fwData->getLength() * 4;
     fw->fw_rawdata = malloc(fw->fw_rawsize, 1, 1);
-    uncompressFirmware((u_char *)fw->fw_rawdata, (uint *)&fw->fw_rawsize, (u_char *)fwData->getBytesNoCopy(), fwData->getLength());
+    if (fw->fw_rawdata == NULL) {
+        err = ENOMEM;
+        goto out;
+    }
+    if (!uncompressFirmware((u_char *)fw->fw_rawdata,
+            (uint *)&fw->fw_rawsize, (u_char *)fwData->getBytesNoCopy(),
+            fwData->getLength()) || fw->fw_rawsize < sizeof(*uhdr)) {
+        err = EINVAL;
+        goto out;
+    }
     XYLog("load firmware %s done\n", sc->sc_fwname);
     
     sc->sc_capaflags = 0;
@@ -1726,8 +2542,8 @@ iwx_read_firmware(struct iwx_softc *sc)
                 
             case IWX_UCODE_TLV_CMD_VERSIONS:
                 if (tlv_len % sizeof(struct iwx_fw_cmd_version)) {
-                    tlv_len /= sizeof(struct iwx_fw_cmd_version);
-                    tlv_len *= sizeof(struct iwx_fw_cmd_version);
+                    err = EINVAL;
+                    goto parse_out;
                 }
                 if (sc->n_cmd_versions != 0) {
                     err = EINVAL;
@@ -2038,7 +2854,16 @@ iwx_read_pnvm(struct iwx_softc *sc)
     }
     fw->pnvm_rawsize = fwData->getLength() * 20;
     fw->pnvm_rawdata = malloc(fw->pnvm_rawsize, 1, 1);
-    uncompressFirmware((u_char *)fw->pnvm_rawdata, (uint *)&fw->pnvm_rawsize, (u_char *)fwData->getBytesNoCopy(), fwData->getLength());
+    if (fw->pnvm_rawdata == NULL) {
+        err = ENOMEM;
+        goto out;
+    }
+    if (!uncompressFirmware((u_char *)fw->pnvm_rawdata,
+            (uint *)&fw->pnvm_rawsize, (u_char *)fwData->getBytesNoCopy(),
+            fwData->getLength()) || fw->pnvm_rawsize < sizeof(*tlv)) {
+        err = EINVAL;
+        goto out;
+    }
     XYLog("load firmware %s done %zu\n", pnvm_name, fw->pnvm_rawsize);
     
     XYLog("Parsing PNVM file\n");
@@ -2115,6 +2940,8 @@ iwx_load_pnvm(struct iwx_softc *sc)
     };
     
 out:
+    pnvmComplete = 0;
+    pnvmStatus = 0;
     /* kick the doorbell */
     if (iwx_nic_lock(sc)) {
         iwx_write_umac_prph(sc, IWX_UREG_DOORBELL_TO_ISR6,
@@ -2122,10 +2949,11 @@ out:
         iwx_nic_unlock(sc);
     }
     
-    err = tsleep_nsec(&sc->sc_init_complete, 0, "iwxinit", SEC_TO_NSEC(2));
-    
+    err = iwx_wait_fw_state(sc, &pnvmComplete, &pnvmComplete,
+        1, 1, SEC_TO_NSEC(2));
+    if (!err && pnvmStatus)
+        err = EIO;
     iwx_pnvm_free(&sc->sc_fw);
-    
     return err;
 }
 
@@ -2475,6 +3303,9 @@ fail:    iwx_free_rx_ring(sc, ring);
 void ItlIwx::
 iwx_disable_rx_dma(struct iwx_softc *sc)
 {
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    (void)iwx_disable_rx_dma_observed(sc);
+#else
     int ntries;
     
     if (iwx_nic_lock(sc)) {
@@ -2497,6 +3328,7 @@ iwx_disable_rx_dma(struct iwx_softc *sc)
         }
         iwx_nic_unlock(sc);
     }
+#endif
 }
 
 void ItlIwx::
@@ -2991,6 +3823,9 @@ out:
 void ItlIwx::
 iwx_apm_stop(struct iwx_softc *sc)
 {
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    (void)iwx_apm_stop_observed(sc);
+#else
     IWX_SETBITS(sc, IWX_CSR_DBG_LINK_PWR_MGMT_REG,
                 IWX_CSR_RESET_LINK_PWR_MGMT_DISABLED);
     IWX_SETBITS(sc, IWX_CSR_HW_IF_CONFIG_REG,
@@ -3015,6 +3850,7 @@ iwx_apm_stop(struct iwx_softc *sc)
      */
     IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
                 IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+#endif
 }
 
 void ItlIwx::
@@ -3169,6 +4005,9 @@ iwx_start_hw(struct iwx_softc *sc)
 void ItlIwx::
 iwx_stop_device(struct iwx_softc *sc)
 {
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    (void)iwx_stop_device_recipe(sc, StopPurpose::OrdinaryRadioRecovery);
+#else
     XYLog("%s\n", __FUNCTION__);
     int qid;
     
@@ -3222,7 +4061,144 @@ iwx_stop_device(struct iwx_softc *sc)
     iwx_dma_contig_free(&sc->prph_scratch_dma);
     iwx_dma_contig_free(&sc->iml_dma);
     iwx_dma_contig_free(&sc->pnvm_dram);
+#endif
 }
+
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+ItlIwx::RxStopObservation ItlIwx::
+iwx_disable_rx_dma_observed(struct iwx_softc *sc)
+{
+    int ntries;
+    
+    if (iwx_nic_lock(sc)) {
+        if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210) {
+            iwx_write_umac_prph(sc, IWX_RFH_RXF_DMA_CFG_GEN3, 0);
+            for (ntries = 0; ntries < 1000; ntries++) {
+                if (iwx_read_umac_prph(sc, IWX_RFH_GEN_STATUS_GEN3) &
+                    IWX_RXF_DMA_IDLE)
+                    break;
+                DELAY(10);
+            }
+        } else {
+            iwx_write_prph(sc, IWX_RFH_RXF_DMA_CFG, 0);
+            for (ntries = 0; ntries < 1000; ntries++) {
+                if (iwx_read_prph(sc, IWX_RFH_GEN_STATUS) &
+                    IWX_RXF_DMA_IDLE)
+                    break;
+                DELAY(10);
+            }
+        }
+        iwx_nic_unlock(sc);
+        return ntries < 1000 ? RxStopObservation::IdleObserved : RxStopObservation::IdleNotObserved;
+    }
+    return RxStopObservation::AccessNotGranted;
+}
+
+ItlIwx::MasterStopObservation ItlIwx::
+iwx_apm_stop_observed(struct iwx_softc *sc)
+{
+    IWX_SETBITS(sc, IWX_CSR_DBG_LINK_PWR_MGMT_REG,
+                IWX_CSR_RESET_LINK_PWR_MGMT_DISABLED);
+    IWX_SETBITS(sc, IWX_CSR_HW_IF_CONFIG_REG,
+                IWX_CSR_HW_IF_CONFIG_REG_PREPARE |
+                IWX_CSR_HW_IF_CONFIG_REG_ENABLE_PME);
+    DELAY(1000);
+    IWX_CLRBITS(sc, IWX_CSR_DBG_LINK_PWR_MGMT_REG,
+                IWX_CSR_RESET_LINK_PWR_MGMT_DISABLED);
+    DELAY(5000);
+    
+    /* stop device's busmaster DMA activity */
+    IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_STOP_MASTER);
+    
+    const bool disabled = iwx_poll_bit(sc, IWX_CSR_RESET,
+                      IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED,
+                      IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED, 100) != 0;
+    if (!disabled)
+        XYLog("%s: timeout waiting for master\n", DEVNAME(sc));
+    
+    /*
+     * Clear "initialization complete" bit to move adapter from
+     * D0A* (powered-up Active) --> D0U* (Uninitialized) state.
+     */
+    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
+                IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+    return disabled ? MasterStopObservation::DisabledObserved : MasterStopObservation::DisabledNotObserved;
+}
+
+ItlIwx::StopDeviceRecipeReport ItlIwx::
+iwx_stop_device_recipe(struct iwx_softc *sc, StopPurpose purpose)
+{
+    StopDeviceRecipeReport report = {};
+    if (purpose != StopPurpose::OrdinaryRadioRecovery && purpose != StopPurpose::SystemOffNoRearm)
+        return report;
+    report.validPurpose = true;
+    XYLog("%s\n", "iwx_stop_device");
+    int qid;
+    
+    iwx_disable_interrupts(sc);
+    sc->sc_flags &= ~IWX_FLAG_USE_ICT;
+    
+    report.rxObservation = iwx_disable_rx_dma_observed(sc);
+    iwx_reset_rx_ring(sc, &sc->rxq);
+    for (qid = 0; qid < nitems(sc->txq); qid++)
+        iwx_reset_tx_ring(sc, &sc->txq[qid]);
+    
+    /* Make sure (redundant) we've released our request to stay awake */
+    IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
+                IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+    if (sc->sc_nic_locks > 0)
+        XYLog("%s: %d active NIC locks forcefully cleared\n",
+              DEVNAME(sc), sc->sc_nic_locks);
+    sc->sc_nic_locks = 0;
+    
+    /* Stop the device, and put it in low power state */
+    report.masterObservation = iwx_apm_stop_observed(sc);
+    
+    /* Reset the on-board processor. */
+    IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
+    DELAY(5000);
+    report.finalResetRequestAndSettleReached = true;
+    
+    /*
+     * Upon stop, the IVAR table gets erased, so msi-x won't
+     * work. This causes a bug in RF-KILL flows, since the interrupt
+     * that enables radio won't fire on the correct irq, and the
+     * driver won't be able to handle the interrupt.
+     * Configure the IVAR table again after reset.
+     */
+    iwx_conf_msix_hw(sc, 1);
+    report.routingConfigured = true;
+    
+    /*
+     * Upon stop, the APM issues an interrupt if HW RF kill is set.
+     * Clear the interrupt again.
+     */
+    iwx_disable_interrupts(sc);
+    report.finalDeviceMaskIssued = true;
+    
+    /* Even though we stop the HW we still want the RF kill interrupt. */
+    if (purpose == StopPurpose::OrdinaryRadioRecovery) {
+        iwx_enable_rfkill_int(sc);
+        iwx_check_rfkill(sc);
+        report.rfkillDisposition = StopStepDisposition::Returned;
+        report.prepareCode = iwx_prepare_card_hw(sc);
+        report.prepareDisposition = StopStepDisposition::Returned;
+    } else {
+        report.rfkillDisposition = StopStepDisposition::SkippedByPurpose;
+        report.prepareDisposition = StopStepDisposition::SkippedByPurpose;
+    }
+    
+    iwx_ctxt_info_free_paging(sc);
+    /* free gen3 devices related firmware DMA resource */
+    iwx_dma_contig_free(&sc->prph_info_dma);
+    iwx_dma_contig_free(&sc->prph_scratch_dma);
+    iwx_dma_contig_free(&sc->iml_dma);
+    iwx_dma_contig_free(&sc->pnvm_dram);
+    report.firmwareResourcesSuffixReached = true;
+    report.sequenceReached = true;
+    return report;
+}
+#endif
 
 void ItlIwx::
 iwx_nic_config(struct iwx_softc *sc)
@@ -3796,7 +4772,7 @@ uint32_t *channel_profile_v4, int nchan_profile)
             }
         }
 
-        if (ch_flags & IWX_NVM_CHANNEL_DFS) {
+        if (ch_flags & IWX_NVM_CHANNEL_RADAR) {
             channel->ic_flags |= IEEE80211_CHAN_DFS;
         }
 
@@ -4293,8 +5269,26 @@ iwx_chan_ctxt_task(void *arg)
         return;
     }
     
+    /* mac80211 ieee80211_recalc_smps_chanctx: static 1/1, dynamic 1/N. */
+    const uint8_t smps = sc->sc_bt_smps_wanted;
+    int chains_static = chains, chains_dynamic = chains;
+    if (smps == IWX_BT_SMPS_STATIC)
+        chains_static = chains_dynamic = 1;
+    else if (smps == IWX_BT_SMPS_DYNAMIC)
+        chains_static = 1;
+    if (smps != sc->sc_bt_smps_applied) {
+        /* SM Power Control: bit 0 enabled, bit 1 dynamic. */
+        const int control = smps == IWX_BT_SMPS_STATIC ? 0x1 :
+            smps == IWX_BT_SMPS_DYNAMIC ? 0x3 : 0x0;
+        int serr = IEEE80211_SEND_ACTION(ic, &in->in_ni, IEEE80211_CATEG_HT,
+                                         IEEE80211_ACTION_SM_PWRSAVE, control);
+        AIRITL_DBG("%s: bt coex smps %u -> %u (grade %u) action -> %d\n", __FUNCTION__,
+              sc->sc_bt_smps_applied, smps, sc->sc_bt_activity, serr);
+        sc->sc_bt_smps_applied = smps;
+    }
+
     err = that->iwx_phy_ctxt_update(sc, in->in_phyctxt,
-                                    in->in_phyctxt->channel, chains, chains, 0);
+                                    in->in_phyctxt->channel, chains_static, chains_dynamic, 0);
     if (err) {
         XYLog("%s: failed to update PHY (error %d)\n",
               __FUNCTION__, err);
@@ -4675,6 +5669,7 @@ iwx_load_firmware(struct iwx_softc *sc)
     int err/*, w*/;
 
     sc->sc_uc.uc_intr = 0;
+    sc->sc_uc.uc_ok = 0;
     
     fws = &sc->sc_fw.fw_sects[IWX_UCODE_TYPE_REGULAR];
     if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210)
@@ -4686,11 +5681,8 @@ iwx_load_firmware(struct iwx_softc *sc)
         return err;
     }
     
-    /* wait for the firmware to load */
-//    for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++) {
-//        err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
-//    }
-    err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", SEC_TO_NSEC(1));
+    err = iwx_wait_fw_state(sc, &sc->sc_uc, &sc->sc_uc.uc_intr,
+        1, 1, SEC_TO_NSEC(1));
     if (err || !sc->sc_uc.uc_ok) {
         if (iwx_nic_lock(sc)) {
             XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
@@ -4865,14 +5857,8 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     if (err)
         return err;
 
-    /* Wait for the init complete notification from the firmware. */
-//    while ((sc->sc_init_complete & wait_flags) != wait_flags) {
-//        err = tsleep_nsec(&sc->sc_init_complete, 0, "iwxinit",
-//            SEC_TO_NSEC(2));
-//        if (err)
-//            return err;
-//    }
-    err = tsleep_nsec(&sc->sc_init_complete, 0, "iwxinit", SEC_TO_NSEC(2));
+    err = iwx_wait_fw_state(sc, &sc->sc_init_complete,
+        &sc->sc_init_complete, wait_flags, wait_flags, SEC_TO_NSEC(2));
     if (err) {
         return err;
     }
@@ -5839,7 +6825,10 @@ iwx_clear_oactive(struct iwx_softc *sc, struct iwx_tx_ring *ring)
             (*ifp->if_start)(ifp);
         }
 #ifdef __PRIVATE_SPI__
-        ifp->iface->signalOutputThread();
+        if (ifp->native_output_ready)
+            ifp->native_output_ready(ifp->native_input_context);
+        else if (ifp->iface)
+            ifp->iface->signalOutputThread();
 #endif
     }
 }
@@ -6163,7 +7152,9 @@ iwx_phy_ctxt_cmd_v3(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
      * between the two antennas is sufficiently different to impact
      * performance.
      */
-    if (active_cnt == 1 && iwx_num_of_ant(iwx_fw_valid_rx_ant(sc)) != 1) {
+    /* Linux iwl_mvm_rx_diversity_allowed: no diversity under BT static or dynamic SMPS. */
+    if (active_cnt == 1 && iwx_num_of_ant(iwx_fw_valid_rx_ant(sc)) != 1 &&
+        sc->sc_bt_smps_applied == IWX_BT_SMPS_OFF) {
         idle_cnt = 2;
         active_cnt = 2;
     }
@@ -6276,6 +7267,8 @@ iwx_phy_ctxt_cmd(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
 int ItlIwx::
 iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
 {
+    if (sc->sc_ic.ic_native_controlled && nativeQuiescing)
+        return ENXIO;
     struct iwx_tx_ring *ring = &sc->txq[IWX_DQA_CMD_QUEUE];
     struct iwx_tfh_tfd *desc;
     struct iwx_tx_data *txdata;
@@ -6294,6 +7287,8 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     code = hcmd->id;
     async = hcmd->flags & IWX_CMD_ASYNC;
     idx = (ring->cur & (ring->ring_count - 1));
+    if (sc->sc_ic.ic_native_controlled && nativeKeyIndexBusy(idx))
+        return ENOSPC;
     
     for (i = 0, paylen = 0; i < nitems(hcmd->len); i++) {
         paylen += hcmd->len[i];
@@ -6545,6 +7540,18 @@ uint32_t ItlIwx::
 iwx_get_tx_ant(struct iwx_softc *sc, struct ieee80211_node *ni,
                                const struct iwx_rate *rinfo, int type, struct ieee80211_frame *wh)
 {
+    /*
+     * Linux iwl_mvm_get_tx_ant: on 2.4 GHz, while BT reports HIGH_TRAFFIC or
+     * more (iwl_mvm_bt_coex_is_shared_ant_avail false), driver-rated frames go
+     * on the antenna not shared with BT (non_shared_ant = ANT_B for HR radios).
+     */
+    struct ieee80211_channel *chan = (ni != NULL) ? ni->ni_chan : NULL;
+    if (chan == NULL && sc->sc_ic.ic_bss != NULL)
+        chan = sc->sc_ic.ic_bss->ni_chan;
+    if (chan != NULL && chan != IEEE80211_CHAN_ANYC && IEEE80211_IS_CHAN_2GHZ(chan) &&
+        sc->sc_bt_activity >= IWX_BT_HIGH_TRAFFIC &&
+        (iwx_fw_valid_tx_ant(sc) & IWX_ANT_B))
+        return (IWX_ANT_B << IWX_RATE_MCS_ANT_POS);
     return ((1 << sc->sc_mgmt_last_antenna_idx) << IWX_RATE_MCS_ANT_POS);
 }
 
@@ -6587,6 +7594,16 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
     if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
         type != IEEE80211_FC0_TYPE_DATA) {
         /* for non-data, use the lowest supported rate */
+        ridx = min_ridx;
+        *flags |= IWX_TX_FLAGS_CMD_RATE;
+    } else if ((ic->ic_flags & IEEE80211_F_RSNON) && !ni->ni_port_valid) {
+        /*
+         * Linux iwl_mvm_set_tx_params driver-rates data until the station is
+         * AUTHORIZED (the 4-way handshake), so iwl_mvm_get_tx_ant can keep it off
+         * the BT-shared antenna. Before port authorization only EAPOL passes
+         * ieee80211 output; send it at the lowest basic rate with the coex
+         * antenna choice below.
+         */
         ridx = min_ridx;
         *flags |= IWX_TX_FLAGS_CMD_RATE;
     } else if (ic->ic_fixed_mcs != -1) {
@@ -7080,8 +8097,12 @@ iwx_power_build_cmd(struct iwx_softc *sc, struct iwx_node *in,
     keep_alive = roundup(keep_alive, 1000) / 1000;
     cmd->keep_alive_seconds = htole16(keep_alive);
     
-    if (ic->ic_opmode != IEEE80211_M_MONITOR)
-        cmd->flags = htole16(IWX_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+    /*
+     * AX20x Bluetooth shares the same CNVi radio complex. Keep Wi-Fi in
+     * continuous active mode so PCIe/radio power-save transitions cannot
+     * steal latency from BLE HID traffic.
+     */
+    cmd->flags = 0;
 }
 
 int ItlIwx::
@@ -7112,8 +8133,11 @@ iwx_power_update_device(struct iwx_softc *sc)
     struct iwx_device_power_cmd cmd = { };
     struct ieee80211com *ic = &sc->sc_ic;
     
-    if (ic->ic_opmode != IEEE80211_M_MONITOR)
-        cmd.flags = htole16(IWX_DEVICE_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+    /*
+     * Linux iwlmvm's CAM mode leaves DEVICE_POWER_FLAGS_POWER_SAVE_ENA clear.
+     * Mirror that behavior for this latency-focused build.
+     */
+    cmd.flags = 0;
     
     return iwx_send_cmd_pdu(sc,
                             IWX_POWER_TABLE_CMD, 0, sizeof(cmd), &cmd);
@@ -7389,6 +8413,9 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
             continue;
         
         channel_num = ieee80211_mhz2ieee(c->ic_freq, 0);
+        if (hasNativeScanProfile() &&
+            !itlNativeScanSelectsChannel(nativeScanProfile, channel_num))
+            continue;
         if (isset(sc->sc_ucode_api,
                   IWX_UCODE_TLV_API_SCAN_EXT_CHAN_VER)) {
             chan->v2.channel_num = channel_num;
@@ -7404,7 +8431,10 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
             chan->v1.iter_interval = htole16(0);
         }
         
-        if (n_ssids != 0 && !bgscan)
+        if (hasNativeScanProfile())
+            chan->flags = htole32(itlNativeScanSSIDMask(nativeScanProfile,
+                (c->ic_flags & IEEE80211_CHAN_PASSIVE) != 0));
+        else if (n_ssids != 0 && !bgscan)
             chan->flags = htole32(1 << 0); /* select SSID 0 */
         chan++;
         nchan++;
@@ -7457,8 +8487,14 @@ iwx_fill_probe_req(struct iwx_softc *sc, struct iwx_scan_probe_req *preq)
     wh->i_fc[1] = IEEE80211_FC1_DIR_NODS;
 //    IEEE80211_ADDR_COPY(ic->ic_myaddr, LLADDR(ifp->if_sadl));
     IEEE80211_ADDR_COPY(wh->i_addr1, etherbroadcastaddr);
-    IEEE80211_ADDR_COPY(wh->i_addr2, ic->ic_myaddr);
-    IEEE80211_ADDR_COPY(wh->i_addr3, etherbroadcastaddr);
+    if (hasNativeScanProfile() && nativeScanProfile.hasScanMac)
+        IEEE80211_ADDR_COPY(wh->i_addr2, nativeScanProfile.scanMac);
+    else
+        IEEE80211_ADDR_COPY(wh->i_addr2, ic->ic_myaddr);
+    if (hasNativeScanProfile() && nativeScanProfile.hasBSSID)
+        IEEE80211_ADDR_COPY(wh->i_addr3, nativeScanProfile.bssid);
+    else
+        IEEE80211_ADDR_COPY(wh->i_addr3, etherbroadcastaddr);
     *(uint16_t *)&wh->i_dur[0] = 0;    /* filled by HW */
     *(uint16_t *)&wh->i_seq[0] = 0;    /* filled by HW */
     
@@ -7742,6 +8778,8 @@ iwx_get_scan_req_umac_data(struct iwx_softc *sc, struct iwx_scan_req_umac *req)
 int ItlIwx::
 iwx_umac_scan(struct iwx_softc *sc, int bgscan)
 {
+    if (nativeScanPending && !nativeScanSubmitting)
+        return EBUSY;
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_host_cmd hcmd = {
@@ -7756,8 +8794,10 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     struct iwx_scan_req_umac_tail_v1 *tailv1;
     struct iwx_scan_umac_chan_param *chanparam;
     size_t req_len;
-    int err, async = bgscan;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+    int err, async = bgscan || hasNativeScanProfile();
+    const uint32_t timeout = bgscan ? htole32(120) : htole32(0);
+    const uint32_t suspend = hasNativeScanProfile() && bgscan &&
+        nativeScanProfile.homeDwell ? htole32(nativeScanProfile.homeDwell) : timeout;
     uint8_t scan_ver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
     
     if (scan_ver == 12)
@@ -7797,13 +8837,13 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         
         req->v7.scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
         req->v7.max_out_time[IWX_SCAN_LB_LMAC_IDX] = timeout;
-        req->v7.suspend_time[IWX_SCAN_LB_LMAC_IDX] = timeout;
+        req->v7.suspend_time[IWX_SCAN_LB_LMAC_IDX] = suspend;
         
         if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
             req->v7.max_out_time[IWX_SCAN_HB_LMAC_IDX] =
                 timeout;
             req->v7.suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-                timeout;
+                suspend;
         }
         
         if (isset(sc->sc_ucode_api,
@@ -7832,7 +8872,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
             req->v6.max_out_time[IWX_SCAN_HB_LMAC_IDX] =
                 timeout;
             req->v6.suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-                timeout;
+                suspend;
         }
         
         req->v6.scan_priority =
@@ -7840,9 +8880,11 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         req->v6.max_out_time[IWX_SCAN_LB_LMAC_IDX] =
             timeout;
         req->v6.suspend_time[IWX_SCAN_LB_LMAC_IDX] =
-            timeout;
+            suspend;
     }
     
+    if (hasNativeScanProfile())
+        req->uid = htole32(nativeScanUID);
     req->ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
     
     cmd_data = iwx_get_scan_req_umac_data(sc, req);
@@ -7866,7 +8908,17 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     }
     
     /* Check if we're doing an active directed scan. */
-    if (ic->ic_des_esslen != 0 && !bgscan) {
+    if (hasNativeScanProfile()) {
+        if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_SCAN_EXT_CHAN_VER))
+            fillNativeScanSSIDs(tail->direct_scan);
+        else
+            fillNativeScanSSIDs(tailv1->direct_scan);
+        if (nativeScanProfile.passive)
+            req->general_flags |= htole32(IWX_UMAC_SCAN_GEN_FLAGS_PASSIVE);
+        else if (nativeScanProfile.ssidCount == 1 &&
+                 nativeScanProfile.ssids[0].len)
+            req->general_flags |= htole32(IWX_UMAC_SCAN_GEN_FLAGS_PRE_CONNECT);
+    } else if (ic->ic_des_esslen != 0 && !bgscan) {
         if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_SCAN_EXT_CHAN_VER)) {
             tail->direct_scan[0].id = IEEE80211_ELEMID_SSID;
             tail->direct_scan[0].len = ic->ic_des_esslen;
@@ -7905,11 +8957,35 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         return err;
     }
     
+    if (hasNativeScanProfile()) {
+        uint8_t active = nativeScanProfile.activeDwell ?
+            static_cast<uint8_t>(nativeScanProfile.activeDwell) : IWL_SCAN_DWELL_ACTIVE;
+        uint8_t passive = nativeScanProfile.passiveDwell ?
+            static_cast<uint8_t>(nativeScanProfile.passiveDwell) : IWL_SCAN_DWELL_PASSIVE;
+        // Fixed requested dwell must not gain an adaptive or extended budget.
+        if (nativeScanProfile.activeDwell || nativeScanProfile.passiveDwell)
+            req->general_flags &= ~htole32(IWX_UMAC_SCAN_GEN_FLAGS_ADAPTIVE_DWELL |
+                                          IWX_UMAC_SCAN_GEN_FLAGS_EXTENDED_DWELL);
+        if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_ADAPTIVE_DWELL_V2)) {
+            req->v8.active_dwell[0] = req->v8.active_dwell[1] = active;
+            req->v8.passive_dwell[0] = req->v8.passive_dwell[1] = passive;
+        } else if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_ADAPTIVE_DWELL)) {
+            req->v7.active_dwell = active;
+            req->v7.passive_dwell = passive;
+        } else {
+            req->v1.active_dwell = active;
+            req->v1.passive_dwell = passive;
+        }
+    }
     /* Specify the scan plan: We'll do one iteration. */
     tail->schedule[0].interval = 0;
     tail->schedule[0].iter_count = 1;
     
+    const bool previousFinalPending = firmwareScanFinalPending;
+    firmwareScanFinalPending = true;
     err = iwx_send_cmd(sc, &hcmd);
+    if (err)
+        firmwareScanFinalPending = previousFinalPending;
     ::free(req);
     return err;
 }
@@ -7919,11 +8995,13 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
 {
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
-    int err = 0, async = bgscan;
+    int err = 0, async = bgscan || hasNativeScanProfile();
     struct iwx_scan_req_umac_v12 *req;
     size_t req_len;
     uint16_t gen_flags = 0;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+    const uint32_t timeout = bgscan ? htole32(120) : htole32(0);
+    const uint32_t suspend = hasNativeScanProfile() && bgscan &&
+        nativeScanProfile.homeDwell ? htole32(nativeScanProfile.homeDwell) : timeout;
     struct iwx_scan_general_params_v10 *general_params;
     struct iwx_scan_channel_params_v4 *cp;
     struct iwx_host_cmd hcmd = {
@@ -7945,15 +9023,21 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     
     general_params = &req->scan_params.general_params;
     
+    if (hasNativeScanProfile())
+        req->uid = htole32(nativeScanUID);
     req->ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
     
-    if (ic->ic_des_esslen == 0 || bgscan)
+    if (hasNativeScanProfile() ? nativeScanProfile.passive :
+        (ic->ic_des_esslen == 0 || bgscan))
         gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE;
     
     gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL |
     IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
     
-    req->scan_params.general_params.flags = gen_flags;
+    if (hasNativeScanProfile() &&
+        (nativeScanProfile.activeDwell || nativeScanProfile.passiveDwell))
+        gen_flags &= ~IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
+    req->scan_params.general_params.flags = htole16(gen_flags);
     
     general_params->adwell_default_social_chn =
         IWX_SCAN_ADWELL_DEFAULT_N_APS_SOCIAL;
@@ -7971,27 +9055,40 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
-        timeout;
+        suspend;
     
     general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
         timeout;
     general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+        suspend;
 
     general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
     general_params->active_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
+    if (hasNativeScanProfile()) {
+        if (nativeScanProfile.activeDwell)
+            general_params->active_dwell[0] = general_params->active_dwell[1] =
+                static_cast<uint8_t>(nativeScanProfile.activeDwell);
+        if (nativeScanProfile.passiveDwell)
+            general_params->passive_dwell[0] = general_params->passive_dwell[1] =
+                static_cast<uint8_t>(nativeScanProfile.passiveDwell);
+    }
     
     /* Specify the scan plan: We'll do one iteration. */
     req->scan_params.periodic_params.schedule[0].interval = 0;
     req->scan_params.periodic_params.schedule[0].iter_count = 1;
     
     err = iwx_fill_probe_req(sc, &req->scan_params.probe_params.preq);
-    if (err)
+    if (err) {
+        ::free(req);
         return err;
+    }
 
-    if (ic->ic_des_esslen != 0 && !bgscan) {
+    if (hasNativeScanProfile()) {
+        req->scan_params.probe_params.ssid_num = nativeScanSSIDCount();
+        fillNativeScanSSIDs(req->scan_params.probe_params.direct_scan);
+    } else if (ic->ic_des_esslen != 0 && !bgscan) {
         req->scan_params.probe_params.ssid_num = 1;
         req->scan_params.probe_params.direct_scan[0].id = IEEE80211_ELEMID_SSID;
         req->scan_params.probe_params.direct_scan[0].len = ic->ic_des_esslen;
@@ -8008,7 +9105,11 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
                                             ic->ic_des_esslen != 0, bgscan);
     cp->num_of_aps_override = IWX_SCAN_ADWELL_N_APS_GO_FRIENDLY;
     
+    const bool previousFinalPending = firmwareScanFinalPending;
+    firmwareScanFinalPending = true;
     err = iwx_send_cmd(sc, &hcmd);
+    if (err)
+        firmwareScanFinalPending = previousFinalPending;
     ::free(req);
     return err;
 }
@@ -8018,13 +9119,15 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
 {
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
-    int err = 0, async = bgscan;
+    int err = 0, async = bgscan || hasNativeScanProfile();
     struct iwx_scan_req_umac_v14 *req;
     size_t req_len;
     uint16_t gen_flags = 0;
     struct iwx_scan_general_params_v10 *general_params;
     struct iwx_scan_channel_params_v6 *cp;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+    const uint32_t timeout = bgscan ? htole32(120) : htole32(0);
+    const uint32_t suspend = hasNativeScanProfile() && bgscan &&
+        nativeScanProfile.homeDwell ? htole32(nativeScanProfile.homeDwell) : timeout;
     struct iwx_host_cmd hcmd = {
         .id = iwx_cmd_id(IWX_SCAN_REQ_UMAC, IWX_LONG_GROUP, 0),
         .len = { 0, },
@@ -8044,15 +9147,21 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     
     general_params = &req->scan_params.general_params;
     
+    if (hasNativeScanProfile())
+        req->uid = htole32(nativeScanUID);
     req->ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
     
-    if (ic->ic_des_esslen == 0 || bgscan)
+    if (hasNativeScanProfile() ? nativeScanProfile.passive :
+        (ic->ic_des_esslen == 0 || bgscan))
         gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE;
     
     gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL |
     IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
     
-    req->scan_params.general_params.flags = gen_flags;
+    if (hasNativeScanProfile() &&
+        (nativeScanProfile.activeDwell || nativeScanProfile.passiveDwell))
+        gen_flags &= ~IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
+    req->scan_params.general_params.flags = htole16(gen_flags);
     
     general_params->adwell_default_social_chn =
         IWX_SCAN_ADWELL_DEFAULT_N_APS_SOCIAL;
@@ -8069,26 +9178,38 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
-        timeout;
+        suspend;
     
     general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
         timeout;
     general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+        suspend;
 
     general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
     general_params->active_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
+    if (hasNativeScanProfile()) {
+        if (nativeScanProfile.activeDwell)
+            general_params->active_dwell[0] = general_params->active_dwell[1] =
+                static_cast<uint8_t>(nativeScanProfile.activeDwell);
+        if (nativeScanProfile.passiveDwell)
+            general_params->passive_dwell[0] = general_params->passive_dwell[1] =
+                static_cast<uint8_t>(nativeScanProfile.passiveDwell);
+    }
     
     /* Specify the scan plan: We'll do one iteration. */
     req->scan_params.periodic_params.schedule[0].interval = 0;
     req->scan_params.periodic_params.schedule[0].iter_count = 1;
     
     err = iwx_fill_probe_req(sc, &req->scan_params.probe_params.preq);
-    if (err)
+    if (err) {
+        ::free(req);
         return err;
-    if (ic->ic_des_esslen != 0 && !bgscan) {
+    }
+    if (hasNativeScanProfile()) {
+        fillNativeScanSSIDs(req->scan_params.probe_params.direct_scan);
+    } else if (ic->ic_des_esslen != 0 && !bgscan) {
         req->scan_params.probe_params.direct_scan[0].id = IEEE80211_ELEMID_SSID;
         req->scan_params.probe_params.direct_scan[0].len = ic->ic_des_esslen;
         memcpy(req->scan_params.probe_params.direct_scan[0].ssid, ic->ic_des_essid,
@@ -8104,7 +9225,11 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     cp->n_aps_override[0] = IWX_SCAN_ADWELL_N_APS_GO_FRIENDLY;
     cp->n_aps_override[1] = IWX_SCAN_ADWELL_N_APS_SOCIAL_CHS;
     
+    const bool previousFinalPending = firmwareScanFinalPending;
+    firmwareScanFinalPending = true;
     err = iwx_send_cmd(sc, &hcmd);
+    if (err)
+        firmwareScanFinalPending = previousFinalPending;
     ::free(req);
     return err;
 }
@@ -8114,6 +9239,23 @@ iwx_mcc_update(struct iwx_softc *sc, struct iwx_mcc_chub_notif *notif)
 {
    struct ieee80211com *ic = &sc->sc_ic;
    struct _ifnet *ifp = IC2IFP(ic);
+
+    if (ic->ic_native_controlled) {
+        if (nativeQuiescing || !sc->sc_nvm.lar_enabled ||
+            (ic->ic_state == IEEE80211_S_RUN &&
+             notif->source_id == IWX_MCC_SOURCE_WIFI))
+            return;
+        const uint16_t mcc = le16toh(notif->mcc);
+        nativeMccRequested[0] = mcc >> 8;
+        nativeMccRequested[1] = mcc & 0xff;
+        nativeMccRequested[2] = 0;
+        nativeMccSource = notif->source_id;
+        ++nativeMccSequence;
+        nativeMccPending = true;
+        nativeMccBusy = 1;
+        iwx_add_task(sc, systq, &nativeMccRefreshTask);
+        return;
+    }
 
     snprintf(sc->sc_fw_mcc, sizeof(sc->sc_fw_mcc), "%c%c",
              (le16toh(notif->mcc) & 0xff00) >> 8, le16toh(notif->mcc) & 0xff);
@@ -8128,6 +9270,54 @@ iwx_mcc_update(struct iwx_softc *sc, struct iwx_mcc_chub_notif *notif)
     }
 
    /* TODO: Schedule a task to send MCC_UPDATE_CMD? */
+}
+
+void ItlIwx::iwx_mcc_task(void *arg)
+{
+    struct iwx_softc *sc = static_cast<struct iwx_softc *>(arg);
+    ItlIwx *hal = container_of(sc, ItlIwx, com);
+    if (!hal->nativeMccPending || hal->nativeQuiescing ||
+        !(sc->sc_ic.ic_if.if_flags & IFF_RUNNING))
+        return;
+    const int generation = sc->sc_generation;
+    const uint64_t sequence = hal->nativeMccSequence;
+    char mcc[3];
+    memcpy(mcc, hal->nativeMccRequested, sizeof(mcc));
+    const uint8_t source = hal->nativeMccSource;
+    hal->nativeMccPending = false;
+    hal->nativeMccRefreshing = true;
+    // Keep the accepted scan's result ownership until the real map commits.
+    // New scans and joins remain closed; final scan completion is deferred.
+    int error = hal->iwx_wait_fw_state(sc, &hal->firmwareScanFinalPending,
+        &hal->firmwareScanFinalPending, ~0, 0, 20000000000ULL);
+    if (!error)
+        error = hal->iwx_send_update_mcc_cmd(sc, mcc, source, sequence);
+    hal->nativeMccRefreshing = false;
+    if (generation != sc->sc_generation || hal->nativeQuiescing)
+        return;
+    if (sequence != hal->nativeMccSequence && hal->nativeMccPending) {
+        hal->iwx_add_task(sc, systq, &hal->nativeMccRefreshTask);
+        return;
+    }
+    if (error == EOPNOTSUPP) {
+        // Stop the real device if the returned domain requires unsupported
+        // RF controls. Admission alone would not stop an established link.
+        hal->nativeMccFailed = true;
+        hal->iwx_stop(&sc->sc_ic.ic_if);
+        return;
+    }
+    hal->nativeMccFailed = error != 0;
+    hal->nativeMccPending = false;
+    hal->nativeMccBusy = 0;
+    hal->wakeupOn(&hal->nativeMccBusy);
+    if (!error && sc->sc_ic.ic_event_handler)
+        (*sc->sc_ic.ic_event_handler)(&sc->sc_ic,
+            IEEE80211_EVT_COUNTRY_CODE_UPDATE, NULL);
+    if (hal->nativeMccScanDeferred)
+        hal->finishNativeScan(error ? kIOReturnError :
+            (hal->nativeScanCancelled ? kIOReturnAborted : hal->nativeMccScanStatus),
+            hal->nativeMccScanFirmwareStatus);
+    hal->tryCompleteNativeRecovery();
 }
 
 uint8_t ItlIwx::
@@ -8556,6 +9746,8 @@ iwx_del_task(struct iwx_softc *sc, struct taskq *taskq, struct task *task)
 int ItlIwx::
 iwx_scan(struct iwx_softc *sc)
 {
+    if (nativeScanPending)
+        return EBUSY;
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = IC2IFP(ic);
@@ -8606,9 +9798,11 @@ iwx_bgscan(struct ieee80211com *ic)
     ItlIwx *that = container_of(sc, ItlIwx, com);
     int err;
     
+    if (that->nativeScanPending)
+        return EBUSY;
     if (sc->sc_flags & IWX_FLAG_SCANNING)
         return 0;
-    
+
     err = that->iwx_umac_scan(sc, 1);
     if (err) {
         XYLog("%s: could not initiate scan\n", DEVNAME(sc));
@@ -8623,7 +9817,9 @@ int ItlIwx::
 iwx_umac_scan_abort(struct iwx_softc *sc)
 {
     struct iwx_umac_scan_abort cmd = { 0 };
-    
+    if (nativeScanPending)
+        cmd.uid = htole32(nativeScanUID);
+
     return iwx_send_cmd_pdu(sc,
                             IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_ABORT_UMAC),
                             0, sizeof(cmd), &cmd);
@@ -8636,7 +9832,7 @@ iwx_scan_abort(struct iwx_softc *sc)
     int err;
     
     err = iwx_umac_scan_abort(sc);
-    if (err == 0)
+    if (err == 0 && !nativeScanPending)
         sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
     return err;
 }
@@ -8886,6 +10082,107 @@ iwx_rs_fw_he_set_enabled_rates(struct iwx_softc *sc,
     }
 }
 
+bool ItlIwx::nativeReassociationReady()
+{
+    const uint32_t contexts = IWX_FLAG_MAC_ACTIVE | IWX_FLAG_BINDING_ACTIVE |
+        IWX_FLAG_STA_ACTIVE;
+    if (!getMainWorkLoop()->inGate() || !nativeDataOutputReady() ||
+        !nativeRegulatoryReady() || nativeStopInProgress ||
+        nativeScanPending || nativeScanSubmitting || firmwareScanFinalPending ||
+        nativeMccPending || nativeMccRefreshing || nativeMccScanDeferred ||
+        (com.sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN | IWX_FLAG_HW_ERR)) ||
+        (com.sc_flags & contexts) != contexts)
+        return false;
+    for (unsigned i = 0; i < nitems(nativeWaiters); ++i)
+        if (nativeWaiters[i].thread)
+            return false;
+    return true;
+}
+
+bool ItlIwx::nativeDataOutputReady() const
+{
+    const struct ieee80211com *ic = &com.sc_ic;
+    return ic->ic_native_controlled && !nativeQuiescing &&
+        (ic->ic_if.if_flags & IFF_RUNNING) &&
+        ic->ic_state == IEEE80211_S_RUN && com.ns_nstate == IEEE80211_S_RUN &&
+        !(ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY) &&
+        !(com.sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_TXFLUSH));
+}
+
+void ItlIwx::clearNativeCurrentRates()
+{
+    memset(&nativeCurrentRates, 0, sizeof(nativeCurrentRates));
+    nativeCurrentRates.vht = nativeCurrentRates.he = 0xffff;
+    nativeCurrentRatesValid = false;
+}
+
+void ItlIwx::captureNativeCurrentRates(struct iwx_softc *sc,
+    struct ieee80211_node *ni, const struct iwx_tlc_config_cmd_v4 &cfg)
+{
+    if (!sc->sc_ic.ic_native_controlled || !ni || ni != sc->sc_ic.ic_bss ||
+        !ni->ni_chan || ni->ni_chan == IEEE80211_CHAN_ANYC ||
+        ni->ni_rates.rs_nrates > sizeof(nativeCurrentRates.legacy))
+        return;
+
+    // These are the masks accepted for asynchronous submission. They do not
+    // acknowledge firmware execution or report the current transmission rate.
+    const uint16_t legacyMask = le16toh(cfg.non_ht_rates);
+    for (unsigned i = 0; i < ni->ni_rates.rs_nrates; ++i) {
+        uint8_t rate = ni->ni_rates.rs_rates[i];
+        int bit = iwx_rs_rval2idx(rate & IEEE80211_RATE_VAL);
+        if (bit >= 0 && (legacyMask & (1U << bit)))
+            nativeCurrentRates.legacy[nativeCurrentRates.legacyCount++] = rate;
+    }
+    const unsigned bw = cfg.max_ch_width == IWX_TLC_MNG_CH_WIDTH_160MHZ ?
+        IWX_TLC_MCS_PER_BW_160 : IWX_TLC_MCS_PER_BW_80;
+    for (unsigned nss = 0; nss < IWX_TLC_NSS_MAX; ++nss) {
+        uint16_t mask = le16toh(cfg.ht_rates[nss][bw]);
+        if (cfg.mode == IWX_TLC_MNG_MODE_HT) {
+            nativeCurrentRates.ht[nss] = mask & 0xff;
+        } else if (cfg.mode == IWX_TLC_MNG_MODE_VHT ||
+                   cfg.mode == IWX_TLC_MNG_MODE_HE) {
+            uint16_t map = 3;
+            if (cfg.mode == IWX_TLC_MNG_MODE_VHT) {
+                if (mask == 0xff) map = 0;
+                else if (mask == 0x1ff) map = 1;
+                else if (mask == 0x3ff) map = 2;
+            } else {
+                if (mask == 0xff) map = 0;
+                else if (mask == 0x3ff) map = 1;
+                else if (mask == 0xfff) map = 2;
+            }
+            uint16_t &out = cfg.mode == IWX_TLC_MNG_MODE_VHT ?
+                nativeCurrentRates.vht : nativeCurrentRates.he;
+            out = (out & ~(3U << (2 * nss))) | (map << (2 * nss));
+        }
+    }
+    nativeCurrentRatesHardwareGeneration = sc->sc_generation;
+    nativeCurrentRatesJoinGeneration = sc->sc_ic.ic_native_join_generation;
+    memcpy(nativeCurrentRatesBssid, ni->ni_bssid, sizeof(nativeCurrentRatesBssid));
+    nativeCurrentRatesFrequency = ni->ni_chan->ic_freq;
+    nativeCurrentRatesWidth = ni->ni_chw;
+    nativeCurrentRatesValid = true;
+}
+
+bool ItlIwx::copyNativeCurrentRates(ItlNativeCurrentRates *out)
+{
+    struct ieee80211com *ic = &com.sc_ic;
+    struct ieee80211_node *ni = ic->ic_bss;
+    if (!out || !getMainWorkLoop()->inGate() || !ic->ic_native_controlled ||
+        !nativeCurrentRatesValid || nativeQuiescing || !nativeRegulatoryReady() ||
+        (com.sc_flags & IWX_FLAG_SHUTDOWN) || !(ic->ic_if.if_flags & IFF_RUNNING) ||
+        ic->ic_state != IEEE80211_S_RUN || com.ns_nstate != IEEE80211_S_RUN ||
+        !ni || !ni->ni_chan || ni->ni_chan == IEEE80211_CHAN_ANYC ||
+        nativeCurrentRatesHardwareGeneration != com.sc_generation ||
+        nativeCurrentRatesJoinGeneration != ic->ic_native_join_generation ||
+        memcmp(nativeCurrentRatesBssid, ni->ni_bssid, sizeof(nativeCurrentRatesBssid)) ||
+        nativeCurrentRatesFrequency != ni->ni_chan->ic_freq ||
+        nativeCurrentRatesWidth != ni->ni_chw)
+        return false;
+    *out = nativeCurrentRates;
+    return true;
+}
+
 int ItlIwx::
 iwx_rs_init(struct iwx_softc *sc, struct iwx_node *in, bool update)
 {
@@ -8897,6 +10194,8 @@ iwx_rs_init(struct iwx_softc *sc, struct iwx_node *in, bool update)
     uint16_t cmd_size;
     uint8_t cmdver;
 
+    if (sc->sc_ic.ic_native_controlled)
+        clearNativeCurrentRates();
     memset(&cfg_cmd, 0, sizeof(cfg_cmd));
 
     for (i = 0; i < rs->rs_nrates; i++) {
@@ -8944,8 +10243,11 @@ iwx_rs_init(struct iwx_softc *sc, struct iwx_node *in, bool update)
     cmdver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD);
     XYLog("%s cmdver %d\n", __FUNCTION__, cmdver);
     if (cmdver == 4) {
-        return iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC,
-                                sizeof(cfg_cmd), &cfg_cmd);
+        int error = iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC,
+                                   sizeof(cfg_cmd), &cfg_cmd);
+        if (!error)
+            captureNativeCurrentRates(sc, ni, cfg_cmd);
+        return error;
     } else if (cmdver < 4 || cmdver == IWX_FW_CMD_VER_UNKNOWN) {
         struct iwl_tlc_config_cmd_v3 cfg_cmd_v3 = {
             .sta_id = cfg_cmd.sta_id,
@@ -8969,8 +10271,11 @@ iwx_rs_init(struct iwx_softc *sc, struct iwx_node *in, bool update)
         if (cmdver == IWX_FW_CMD_VER_UNKNOWN || cmdver < 3)
             cmd_size -= 4;
         
-        return iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC, cmd_size,
-                                &cfg_cmd_v3);
+        int error = iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC, cmd_size,
+                                   &cfg_cmd_v3);
+        if (!error)
+            captureNativeCurrentRates(sc, ni, cfg_cmd);
+        return error;
     } else {
         return -EINVAL;
     }
@@ -9156,6 +10461,8 @@ iwx_phy_ctxt_update(struct iwx_softc *sc, struct iwx_phy_ctxt *phyctxt,
 int ItlIwx::
 iwx_auth(struct iwx_softc *sc)
 {
+    if (sc->sc_ic.ic_native_controlled)
+        clearNativeCurrentRates();
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
@@ -9338,6 +10645,9 @@ iwx_run(struct iwx_softc *sc)
     
     splassert(IPL_NET);
     
+    /* A new association starts with SMPS disabled, as our HT capability says. */
+    sc->sc_bt_smps_wanted = sc->sc_bt_smps_applied = IWX_BT_SMPS_OFF;
+    
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         /* Add a MAC context and a sniffing STA. */
         err = iwx_auth(sc);
@@ -9440,12 +10750,19 @@ iwx_run(struct iwx_softc *sc)
               DEVNAME(sc), err);
         return err;
     }
+
+    /* Linux: iwl_mvm_bss_info_changed_station_assoc -> iwl_mvm_bt_coex_vif_change. */
+    iwx_bt_coex_update_ci(sc, in);
+    /* Linux iwl_mvm_bt_coex_vif_change also re-applies SMPS from the last BT report. */
+    iwx_bt_coex_eval_smps(sc);
     return 0;
 }
 
 int ItlIwx::
 iwx_run_stop(struct iwx_softc *sc)
 {
+    if (sc->sc_ic.ic_native_controlled)
+        clearNativeCurrentRates();
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
     int err, i;
@@ -9501,6 +10818,8 @@ iwx_run_stop(struct iwx_softc *sc)
         return err;
     }
     
+    /* Disassociation ends BT SMPS before the chains are reset (see the end of this function). */
+    sc->sc_bt_smps_wanted = sc->sc_bt_smps_applied = IWX_BT_SMPS_OFF;
     /* Reset Tx chains in case MIMO was enabled. */
     if ((in->in_ni.ni_flags & IEEE80211_NODE_HT) &&
         iwx_mimo_enabled(sc)) {
@@ -9512,6 +10831,9 @@ iwx_run_stop(struct iwx_softc *sc)
         }
     }
     
+    /* Linux: disassociation also re-runs the coex update, which clears CI. */
+    iwx_bt_coex_update_ci(sc, NULL);
+    sc->sc_bt_smps_wanted = sc->sc_bt_smps_applied = IWX_BT_SMPS_OFF;
     return 0;
 }
 
@@ -9519,6 +10841,219 @@ struct ieee80211_node *ItlIwx::
 iwx_node_alloc(struct ieee80211com *ic)
 {
     return (struct ieee80211_node *)malloc(sizeof (struct iwx_node), 0, M_NOWAIT | M_ZERO);
+}
+
+bool ItlIwx::nativeKeyInstallPending() const
+{
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i)
+        if (nativeKeyInstalls[i].active)
+            return true;
+    return false;
+}
+
+bool ItlIwx::nativeKeyIndexBusy(unsigned index) const
+{
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i)
+        if (nativeKeyInstalls[i].active &&
+            nativeKeyInstalls[i].commandIndex == index)
+            return true;
+    return false;
+}
+
+bool ItlIwx::nativeKeyContextMatches(struct ieee80211_node *ni) const
+{
+    return ni && ni == com.sc_ic.ic_bss &&
+        nativeKeyHardwareGeneration == com.sc_generation &&
+        nativeKeyJoinGeneration == com.sc_ic.ic_native_join_generation &&
+        !memcmp(nativeKeyBssid, ni->ni_bssid, sizeof(nativeKeyBssid));
+}
+
+bool ItlIwx::iwx_key_ready(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    struct iwx_softc *sc = (struct iwx_softc *)ic->ic_softc;
+    ItlIwx *that = container_of(sc, ItlIwx, com);
+    if (!ic->ic_native_controlled)
+        return true;
+    if (!ni || that->nativeQuiescing || ni != ic->ic_bss ||
+        ic->ic_state != IEEE80211_S_RUN || !(ic->ic_if.if_flags & IFF_RUNNING))
+        return false;
+    // Pure software cipher profiles do not create a hardware-key cohort.
+    if (!that->nativeKeyContextMatches(ni))
+        return true;
+    that->nativeKeyPortRequested = true;
+    if (that->nativeKeyFailed)
+        return false;
+    for (unsigned i = 0; i < nitems(that->nativeKeyInstalls); ++i) {
+        const NativeKeyInstall &pending = that->nativeKeyInstalls[i];
+        if (pending.active && pending.hardwareGeneration == sc->sc_generation &&
+            pending.joinGeneration == ic->ic_native_join_generation &&
+            !memcmp(pending.bssid, ni->ni_bssid, sizeof(pending.bssid)))
+            return false;
+    }
+    return true;
+}
+
+int ItlIwx::submitNativeKey(struct ieee80211_node *ni, struct ieee80211_key *key,
+    const struct iwx_add_sta_key_cmd *command)
+{
+    struct ieee80211com *ic = &com.sc_ic;
+    if (!ni || !getMainWorkLoop()->inGate() || nativeQuiescing || ni != ic->ic_bss ||
+        !(ic->ic_if.if_flags & IFF_RUNNING))
+        return ENXIO;
+    if (!nativeKeyContextMatches(ni)) {
+        nativeKeyHardwareGeneration = com.sc_generation;
+        nativeKeyJoinGeneration = ic->ic_native_join_generation;
+        memcpy(nativeKeyBssid, ni->ni_bssid, sizeof(nativeKeyBssid));
+        nativeKeyFailed = nativeKeyPortRequested = false;
+    }
+    if (nativeKeyFailed)
+        return EIO;
+    struct iwx_tx_ring *ring = &com.txq[IWX_DQA_CMD_QUEUE];
+    const unsigned index = ring->cur & (ring->ring_count - 1);
+    if (index > 0xff)
+        return ENOSPC;
+    NativeKeyInstall *record = NULL;
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i) {
+        if (nativeKeyInstalls[i].active && nativeKeyInstalls[i].commandIndex == index)
+            return ENOSPC;
+        if (!nativeKeyInstalls[i].active && !record)
+            record = &nativeKeyInstalls[i];
+    }
+    if (!record)
+        return ENOSPC;
+    memset(record, 0, sizeof(*record));
+    record->commandIndex = index;
+    record->keyId = key->k_id;
+    record->group = bool(key->k_flags & IEEE80211_KEY_GROUP);
+    record->hardwareGeneration = com.sc_generation;
+    record->joinGeneration = ic->ic_native_join_generation;
+    memcpy(record->bssid, ni->ni_bssid, sizeof(record->bssid));
+    // send_cmd copies the command before returning. The record holds only
+    // copied identity, never a node/key pointer or borrowed key bytes.
+    int error = iwx_send_cmd_pdu(&com, IWX_ADD_STA_KEY, IWX_CMD_ASYNC,
+        sizeof(*command), command);
+    if (error) {
+        memset(record, 0, sizeof(*record));
+        return error;
+    }
+    // The async send never drops the native main gate or invokes RX. Activate
+    // the copied record before releasing that gate, after successful enqueue.
+    record->active = true;
+    clock_interval_to_deadline(1, kSecondScale, &record->deadline);
+    if (!(key->k_flags & IEEE80211_KEY_GROUP))
+        nativeKeyPortRequested = false;
+    ni->ni_port_valid = 0;
+    ic->ic_if.if_timer = 1;
+    return 0;
+}
+
+void ItlIwx::failNativeKeys(struct ieee80211_node *ni, int error)
+{
+    struct ieee80211com *ic = &com.sc_ic;
+    if (!nativeKeyContextMatches(ni) || nativeKeyFailed || nativeQuiescing)
+        return;
+    const int hardwareGeneration = com.sc_generation;
+    struct ieee80211_native_join_event event = {};
+    event.generation = ic->ic_native_join_generation;
+    event.status = IEEE80211_REASON_AUTH_LEAVE;
+    IEEE80211_ADDR_COPY(event.bssid, ni->ni_bssid);
+    auto stillCurrent = [&]() {
+        return !nativeQuiescing && com.sc_generation == hardwareGeneration &&
+            ic->ic_native_join_generation == event.generation &&
+            ic->ic_bss && ic->ic_bss == ni &&
+            !memcmp(event.bssid, ic->ic_bss->ni_bssid, sizeof(event.bssid));
+    };
+    nativeKeyFailed = true;
+    nativeKeyPortRequested = false;
+    ni->ni_port_valid = 0;
+    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    // A failed async install must not remain eligible for byte-only dedupe on
+    // retry. Generic delete frees software state and clears the host key only.
+    if (ni->ni_pairwise_key.k_cipher == IEEE80211_CIPHER_CCMP)
+        ieee80211_delete_key(ic, ni, &ni->ni_pairwise_key);
+    for (unsigned i = 0; i < IEEE80211_GROUP_NKID; ++i)
+        if (ic->ic_nw_keys[i].k_cipher == IEEE80211_CIPHER_CCMP)
+            ieee80211_delete_key(ic, ni, &ic->ic_nw_keys[i]);
+    ieee80211_set_link_state(ic, LINK_STATE_DOWN);
+    XYLog("native key completion failed: %d\n", error);
+    if (!stillCurrent() || ic->ic_state != IEEE80211_S_RUN)
+        return;
+    // This is an actual local deauthentication. Preserve its reason/BSSID for
+    // WCL before the state transition can clear the station identity.
+    IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+        IEEE80211_REASON_AUTH_LEAVE);
+    if (!stillCurrent())
+        return;
+    if (ic->ic_event_handler)
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, &event);
+    // An observer may synchronously stop or replace this association.
+    if (!stillCurrent())
+        return;
+    ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+}
+
+void ItlIwx::nativeKeyResponse(struct iwx_rx_packet *packet, int queue, int index)
+{
+    if (!packet || queue != IWX_DQA_CMD_QUEUE || packet->hdr.qid != queue ||
+        packet->hdr.idx != index || packet->hdr.cmd != IWX_ADD_STA_KEY ||
+        ((packet->hdr.group_id & ~IWX_CMD_FAILED_MSK) != IWX_LONG_GROUP &&
+         (packet->hdr.group_id & ~IWX_CMD_FAILED_MSK) != 0))
+        return;
+    NativeKeyInstall *record = NULL;
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i)
+        if (nativeKeyInstalls[i].active && nativeKeyInstalls[i].commandIndex == index) {
+            record = &nativeKeyInstalls[i]; break;
+        }
+    if (!record)
+        return;
+    struct ieee80211_node *ni = com.sc_ic.ic_bss;
+    const bool current = ni && !record->expired &&
+        record->hardwareGeneration == com.sc_generation &&
+        record->joinGeneration == com.sc_ic.ic_native_join_generation &&
+        !memcmp(record->bssid, ni->ni_bssid, sizeof(record->bssid)) &&
+        nativeKeyContextMatches(ni);
+    uint32_t status = 0;
+    const bool valid = !(packet->hdr.group_id & IWX_CMD_FAILED_MSK) &&
+        iwx_rx_packet_len(packet) == sizeof(packet->hdr) + sizeof(status);
+    if (valid)
+        memcpy(&status, packet->data, sizeof(status));
+    memset(record, 0, sizeof(*record));
+    if (current) {
+        if (!valid || le32toh(status) != IWX_ADD_STA_SUCCESS)
+            failNativeKeys(ni, EIO);
+        else if (nativeKeyPortRequested)
+            ieee80211_authorize_port(&com.sc_ic, ni);
+    }
+}
+
+void ItlIwx::expireNativeKeys()
+{
+    uint64_t now;
+    clock_get_uptime(&now);
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i) {
+        NativeKeyInstall &record = nativeKeyInstalls[i];
+        if (!record.active || record.expired || now < record.deadline)
+            continue;
+        record.expired = true;
+        if (record.hardwareGeneration == com.sc_generation &&
+            record.joinGeneration == com.sc_ic.ic_native_join_generation)
+            failNativeKeys(com.sc_ic.ic_bss, ETIMEDOUT);
+        // Do not reuse an unacknowledged command index. Recovery stops DMA and
+        // invalidates the hardware generation before reset releases its record.
+        if (!nativeQuiescing && !(com.sc_flags & IWX_FLAG_SHUTDOWN))
+            task_add(systq, &com.init_task);
+    }
+}
+
+void ItlIwx::resetNativeKeys()
+{
+    for (unsigned i = 0; i < nitems(nativeKeyInstalls); ++i) {
+        memset(&nativeKeyInstalls[i], 0, sizeof(nativeKeyInstalls[i]));
+    }
+    nativeKeyHardwareGeneration = 0;
+    nativeKeyJoinGeneration = 0;
+    memset(nativeKeyBssid, 0, sizeof(nativeKeyBssid));
+    nativeKeyFailed = nativeKeyPortRequested = false;
 }
 
 int ItlIwx::
@@ -9551,6 +11086,8 @@ iwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     
     cmd.transmit_seq_cnt = htole64(k->k_tsc);
     
+    if (ic->ic_native_controlled)
+        return that->submitNativeKey(ni, k, &cmd);
     return that->iwx_send_cmd_pdu(sc, IWX_ADD_STA_KEY, IWX_CMD_ASYNC,
                             sizeof(cmd), &cmd);
 }
@@ -9569,6 +11106,19 @@ iwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
         return;
     }
     
+    if (ic->ic_native_controlled && that->nativeKeyContextMatches(ni)) {
+        for (unsigned i = 0; i < nitems(that->nativeKeyInstalls); ++i) {
+            const NativeKeyInstall &pending = that->nativeKeyInstalls[i];
+            if (pending.active && pending.hardwareGeneration == sc->sc_generation &&
+                pending.joinGeneration == ic->ic_native_join_generation &&
+                !memcmp(pending.bssid, ni->ni_bssid, sizeof(pending.bssid)) &&
+                pending.keyId == k->k_id &&
+                pending.group == bool(k->k_flags & IEEE80211_KEY_GROUP)) {
+                that->nativeKeyFailed = true;
+                ni->ni_port_valid = 0;
+            }
+        }
+    }
     memset(&cmd, 0, sizeof(cmd));
     
     cmd.common.key_flags = htole16(IWX_STA_KEY_NOT_VALID |
@@ -9683,6 +11233,24 @@ iwx_newstate_task(void *psc)
             
         case IEEE80211_S_SCAN:
         next_scan:
+            if (ic->ic_native_controlled) {
+                /*
+                 * WCL owns every scan, as with Apple's driver, which never
+                 * scans on its own. Enter SCAN idle with the same bookkeeping
+                 * iwx_scan does, without a firmware scan. A WCL scan in
+                 * flight (nativeScanPending/BGSCAN) is left untouched.
+                 */
+                if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) == IFM_AUTO)
+                    ieee80211_setmode(ic, IEEE80211_MODE_AUTO);
+                ieee80211_set_link_state(ic, LINK_STATE_DOWN);
+                ieee80211_node_cleanup(ic, ic->ic_bss);
+                AIRITL_DBG("%s: native %s -> SCAN idle (no HAL scan)\n", __FUNCTION__,
+                      ieee80211_state_name[ic->ic_state]);
+                ic->ic_state = IEEE80211_S_SCAN;
+                that->wakeupOn(&ic->ic_state);
+                splx(s);
+                return;
+            }
             err = that->iwx_scan(sc);
             if (err)
                 break;
@@ -9909,12 +11477,155 @@ iwx_send_bt_init_conf(struct iwx_softc *sc)
 {
     XYLog("%s\n", __FUNCTION__);
     struct iwx_bt_coex_cmd bt_cmd;
-    
-    bt_cmd.mode = htole32(IWX_BT_COEX_WIFI);
-    bt_cmd.enabled_modules = 0;
-    
+
+    bt_cmd.mode = htole32(IWX_BT_COEX_NW);
+    bt_cmd.enabled_modules =
+        htole32(IWX_BT_COEX_HIGH_BAND_RET | IWX_BT_COEX_SYNC2SCO_ENABLED);
+
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BT_MPLUT_SUPPORT))
+        bt_cmd.enabled_modules |= htole32(IWX_BT_COEX_MPLUT_ENABLED);
+
+    /* As Linux: a new BT config forgets the last CI command and BT report. */
+    memset(&sc->sc_last_bt_ci, 0, sizeof(sc->sc_last_bt_ci));
+    sc->sc_bt_activity = IWX_BT_OFF;
+    sc->sc_bt_rrc = 0;
+    sc->sc_bt_smps_wanted = sc->sc_bt_smps_applied = IWX_BT_SMPS_OFF;
+
     return iwx_send_cmd_pdu(sc, IWX_BT_CONFIG, 0, sizeof(bt_cmd),
                             &bt_cmd);
+}
+
+/* Linux mvm/coex.c iwl_ci_mask: 20MHz / 40MHz below / 40MHz above, per 2.4 GHz channel. */
+static const uint64_t iwx_ci_mask[][3] = {
+    /* dummy entry for channel 0 */
+    {0, 0, 0},
+    {0x0000001FFFULL, 0x0ULL, 0x00007FFFFFULL},
+    {0x000000FFFFULL, 0x0ULL, 0x0003FFFFFFULL},
+    {0x000003FFFCULL, 0x0ULL, 0x000FFFFFFCULL},
+    {0x00001FFFE0ULL, 0x0ULL, 0x007FFFFFE0ULL},
+    {0x00007FFF80ULL, 0x00007FFFFFULL, 0x01FFFFFF80ULL},
+    {0x0003FFFC00ULL, 0x0003FFFFFFULL, 0x0FFFFFFC00ULL},
+    {0x000FFFF000ULL, 0x000FFFFFFCULL, 0x3FFFFFF000ULL},
+    {0x007FFF8000ULL, 0x007FFFFFE0ULL, 0xFFFFFF8000ULL},
+    {0x01FFFE0000ULL, 0x01FFFFFF80ULL, 0xFFFFFE0000ULL},
+    {0x0FFFF00000ULL, 0x0FFFFFFC00ULL, 0x0ULL},
+    {0x3FFFC00000ULL, 0x3FFFFFF000ULL, 0x0ULL},
+    {0xFFFE000000ULL, 0xFFFFFF8000ULL, 0x0ULL},
+    {0xFFF8000000ULL, 0xFFFFFE0000ULL, 0x0ULL},
+    {0xFE00000000ULL, 0x0ULL, 0x0ULL},
+};
+
+/*
+ * Tell the firmware which 2.4 GHz channel Wi-Fi uses (Linux
+ * iwl_mvm_bt_coex_notif_handle, families before AX210). in == NULL, or a
+ * channel outside 2.4 GHz, sends an empty command. Like Linux, the command is
+ * only sent when it differs from the last one. A failure is logged, not fatal.
+ */
+int ItlIwx::
+iwx_bt_coex_update_ci(struct iwx_softc *sc, struct iwx_node *in)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_bt_coex_ci_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+    if (in != NULL && in->in_ni.ni_chan != NULL &&
+        IEEE80211_IS_CHAN_2GHZ(in->in_ni.ni_chan)) {
+        u_int chan = ieee80211_chan2ieee(ic, in->in_ni.ni_chan);
+        struct iwx_phy_ctxt *phy = in->in_phyctxt ? in->in_phyctxt : &sc->sc_phyctxt[0];
+        if (chan > 0 && chan < nitems(iwx_ci_mask)) {
+            int bw = 0;
+            if (in->in_ni.ni_chw == IEEE80211_CHAN_WIDTH_40) {
+                uint8_t sco = (in->in_ni.ni_htop0 & IEEE80211_HTOP0_SCO_MASK) >>
+                    IEEE80211_HTOP0_SCO_SHIFT;
+                if (sco == IEEE80211_HTOP0_SCO_SCA)
+                    bw = 2; /* center above the primary */
+                else if (sco == IEEE80211_HTOP0_SCO_SCB)
+                    bw = 1; /* center below the primary */
+            }
+            cmd.bt_primary_ci = htole64(iwx_ci_mask[chan][bw]);
+            cmd.primary_ch_phy_id = htole32(phy->id);
+        }
+    }
+
+    if (memcmp(&cmd, &sc->sc_last_bt_ci, sizeof(cmd)) == 0)
+        return 0;
+
+    int err = iwx_send_cmd_pdu(sc, IWX_BT_COEX_CI, 0, sizeof(cmd), &cmd);
+    AIRITL_DBG("%s: bt coex ci primary=0x%llx phy=%u -> %d\n", __FUNCTION__,
+          (unsigned long long)le64toh(cmd.bt_primary_ci),
+          le32toh(cmd.primary_ch_phy_id), err);
+    if (err == 0)
+        memcpy(&sc->sc_last_bt_ci, &cmd, sizeof(cmd));
+    return err;
+}
+
+/*
+ * IWX_BT_PROFILE_NOTIFICATION (Linux iwl_mvm_rx_bt_coex_old_notif). Records the
+ * BT activity grade and logs changes. Linux also adjusts SMPS from this grade;
+ * that needs an SM power save action frame and is not done here.
+ */
+void ItlIwx::
+iwx_bt_coex_notif(struct iwx_softc *sc, struct iwx_rx_packet *pkt)
+{
+    if (iwx_rx_packet_payload_len(pkt) < sizeof(struct iwx_bt_coex_prof_old_notif)) {
+        XYLog("%s: short bt coex notif len=%d\n", __FUNCTION__,
+              iwx_rx_packet_payload_len(pkt));
+        return;
+    }
+    const struct iwx_bt_coex_prof_old_notif *notif =
+        (const struct iwx_bt_coex_prof_old_notif *)pkt->data;
+    uint32_t grade = le32toh(notif->bt_activity_grading);
+    sc->sc_bt_notif_count++;
+    if (grade != sc->sc_bt_activity || sc->sc_bt_notif_count <= 3)
+        AIRITL_DBG("%s: bt coex notif #%u grading=%u ci_compliance=%u lut=%u/%u ttc=0x%x rrc=0x%x\n",
+              __FUNCTION__, sc->sc_bt_notif_count, grade,
+              le32toh(notif->bt_ci_compliance), le32toh(notif->primary_ch_lut),
+              le32toh(notif->secondary_ch_lut), notif->ttc_status, notif->rrc_status);
+    sc->sc_bt_activity = grade;
+    sc->sc_bt_rrc = notif->rrc_status;
+    iwx_bt_coex_eval_smps(sc);
+}
+
+/*
+ * Linux iwl_mvm_bt_notif_per_link: on 2.4 GHz, BT HIGH_TRAFFIC or more asks
+ * for static SMPS (one RX chain), LOW_TRAFFIC for dynamic SMPS, otherwise
+ * none; the reduced-RX-chain request is lifted when the firmware reports RRC
+ * for our PHY context. chan_ctxt_task tells the AP and updates the PHY context.
+ */
+void ItlIwx::
+iwx_bt_coex_eval_smps(struct iwx_softc *sc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
+    uint8_t wanted = IWX_BT_SMPS_OFF;
+
+    if (ic->ic_state == IEEE80211_S_RUN && in != NULL &&
+        in->in_ni.ni_chan != NULL && in->in_phyctxt != NULL &&
+        IEEE80211_IS_CHAN_2GHZ(in->in_ni.ni_chan) &&
+        (in->in_ni.ni_flags & IEEE80211_NODE_HT) && iwx_mimo_enabled(sc) &&
+        !(in->in_phyctxt->id < 8 && (sc->sc_bt_rrc & (1 << in->in_phyctxt->id)))) {
+        /*
+         * Linux starts static SMPS at VERY_HIGH with COEX_SCHEMA_2 firmware and at
+         * HIGH otherwise. On this AX201 the firmware reports an active BT HID
+         * mouse as alternating LOW/HIGH and never VERY_HIGH, so the schema-2
+         * threshold never engages static SMPS. Deliberate divergence, favouring
+         * BT latency over 2.4 GHz MIMO throughput: static SMPS (one RX chain) from
+         * HIGH on all firmware. Hysteresis: once static, stay static while BT is
+         * at least LOW, so the LOW/HIGH alternation does not flap the PHY context.
+         */
+        const uint32_t minStatic = IWX_BT_HIGH_TRAFFIC;
+        if (sc->sc_bt_activity >= minStatic ||
+            ((sc->sc_bt_smps_applied == IWX_BT_SMPS_STATIC ||
+              sc->sc_bt_smps_wanted == IWX_BT_SMPS_STATIC) &&
+             sc->sc_bt_activity >= IWX_BT_LOW_TRAFFIC))
+            wanted = IWX_BT_SMPS_STATIC;
+        else if (sc->sc_bt_activity >= IWX_BT_LOW_TRAFFIC)
+            wanted = IWX_BT_SMPS_DYNAMIC;
+    }
+    sc->sc_bt_smps_wanted = wanted;
+    if (wanted != sc->sc_bt_smps_applied &&
+        ic->ic_state == IEEE80211_S_RUN && (sc->sc_flags & IWX_FLAG_STA_ACTIVE))
+        iwx_add_task(sc, systq, &sc->chan_ctxt_task);
 }
 
 int ItlIwx::
@@ -9957,7 +11668,8 @@ iwx_send_soc_conf(struct iwx_softc *sc)
 }
 
 int ItlIwx::
-iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
+iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2,
+    int source, uint64_t sequence)
 {
     XYLog("%s\n", __FUNCTION__);
     struct iwx_mcc_update_cmd mcc_cmd;
@@ -9970,6 +11682,11 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
     struct iwx_mcc_update_resp *resp;
     size_t resp_len;
     int err;
+    uint32_t channels;
+    uint16_t actualMcc;
+    uint16_t regulatoryCaps;
+    uint8_t responseVersion;
+    const int generation = sc->sc_generation;
     
     memset(&mcc_cmd, 0, sizeof(mcc_cmd));
     mcc_cmd.mcc = htole16(alpha2[0] << 8 | alpha2[1]);
@@ -9979,6 +11696,8 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
     else
         mcc_cmd.source_id = IWX_MCC_SOURCE_OLD_FW;
     
+    if (source >= 0)
+        mcc_cmd.source_id = static_cast<uint8_t>(source);
     hcmd.len[0] = sizeof(struct iwx_mcc_update_cmd);
     hcmd.resp_pkt_len = IWX_CMD_RESP_MAX;
     
@@ -9999,8 +11718,9 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
     }
     
     resp = (struct iwx_mcc_update_resp *)pkt->data;
-    if (resp_len != sizeof(*resp) +
-        resp->n_channels * sizeof(resp->channels[0])) {
+    channels = le32toh(resp->n_channels);
+    if (!channels || channels > IWX_NUM_CHANNELS ||
+        resp_len != sizeof(*resp) + channels * sizeof(resp->channels[0])) {
         err = EIO;
         goto out;
     }
@@ -10008,8 +11728,106 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
     DPRINTF(("MCC status=0x%x mcc=0x%x cap=0x%x time=0x%x geo_info=0x%x source_id=0x%d n_channels=%u\n",
              resp->status, resp->mcc, resp->cap, resp->time, resp->geo_info, resp->source_id, resp->n_channels));
 
-    /* Update channel map for net80211 and our scan configuration. */
-    iwx_init_channel_map(sc, NULL, resp->channels, resp->n_channels);
+    if (sc->sc_ic.ic_native_controlled &&
+        (generation != sc->sc_generation || nativeQuiescing)) {
+        err = ENXIO;
+        goto out;
+    }
+    if (sequence && sequence != nativeMccSequence) {
+        err = EAGAIN;
+        goto out;
+    }
+    actualMcc = le16toh(resp->mcc);
+    if (!actualMcc)
+        actualMcc = 0x3030; // Intel's documented NVM/world workaround.
+    if (sc->sc_ic.ic_native_controlled) {
+        const uint32_t status = le32toh(resp->status);
+        if (status != IWX_MCC_RESP_NEW_CHAN_PROFILE &&
+            status != IWX_MCC_RESP_SAME_CHAN_PROFILE) {
+            err = EIO;
+            goto out;
+        }
+        responseVersion = iwx_lookup_notif_ver(sc, IWX_LONG_GROUP,
+            IWX_MCC_UPDATE_CMD);
+        if (responseVersion == IWX_FW_CMD_VER_UNKNOWN ||
+            (le16toh(resp->geo_info) & 1U)) {
+            // GEO_WMM_ETSI_5GHZ_INFO requires country/frequency WMM limits.
+            // The response has no EDCA table and this HAL has no regdb source.
+            err = EOPNOTSUPP;
+            goto out;
+        }
+        regulatoryCaps = le16toh(resp->cap);
+        const bool disableHE = regulatoryCaps & (1U << 10);
+        if (disableHE && sc->sc_ic.ic_state == IEEE80211_S_RUN &&
+            sc->sc_ic.ic_bss && (sc->sc_ic.ic_bss->ni_flags & IEEE80211_NODE_HE)) {
+            // An existing HE link needs a new negotiated association.
+            err = EOPNOTSUPP;
+            goto out;
+        }
+        const bool allow40 = responseVersion >= 6 ?
+            (regulatoryCaps & (1U << 8)) : !(regulatoryCaps & (1U << 7));
+        const bool allow80 = regulatoryCaps &
+            (1U << (responseVersion >= 6 ? 4 : 3));
+        const bool allow160 = regulatoryCaps &
+            (1U << (responseVersion >= 6 ? 3 : 2));
+        if (sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_ic.ic_bss &&
+            sc->sc_ic.ic_bss->ni_chan &&
+            IEEE80211_IS_CHAN_5GHZ(sc->sc_ic.ic_bss->ni_chan)) {
+            const uint8_t width = sc->sc_ic.ic_bss->ni_chw;
+            if ((width == IEEE80211_CHAN_WIDTH_40 && !allow40) ||
+                (width == IEEE80211_CHAN_WIDTH_80 && !allow80) ||
+                ((width == IEEE80211_CHAN_WIDTH_160 ||
+                  width == IEEE80211_CHAN_WIDTH_80P80) && !allow160)) {
+                err = EOPNOTSUPP;
+                goto out;
+            }
+        }
+        for (unsigned ch = IWX_NUM_2GHZ_CHANNELS; ch < channels; ++ch) {
+            uint32_t flags = le32toh(resp->channels[ch]);
+            if (!allow40) flags &= ~IWX_NVM_CHANNEL_40MHZ;
+            if (!allow80) flags &= ~IWX_NVM_CHANNEL_80MHZ;
+            if (!allow160) flags &= ~IWX_NVM_CHANNEL_160MHZ;
+            resp->channels[ch] = htole32(flags);
+        }
+        if (disableHE) {
+            nativeMccHeSuspended |= !!(sc->sc_ic.ic_flags & IEEE80211_F_HEON);
+            sc->sc_ic.ic_flags &= ~IEEE80211_F_HEON;
+            sc->sc_ic.ic_modecaps &= ~(1U << IEEE80211_MODE_11AX);
+            if (sc->sc_ic.ic_curmode == IEEE80211_MODE_11AX)
+                sc->sc_ic.ic_curmode = IEEE80211_MODE_AUTO;
+        } else if (sc->sc_nvm.sku_cap_11ax_enable) {
+            sc->sc_ic.ic_modecaps |= 1U << IEEE80211_MODE_11AX;
+            if (nativeMccHeSuspended)
+                sc->sc_ic.ic_flags |= IEEE80211_F_HEON;
+            nativeMccHeSuspended = false;
+        }
+        memset(sc->sc_ic.ic_channels, 0, sizeof(sc->sc_ic.ic_channels));
+        sc->sc_nvm.vht160_supported = false;
+    }
+    iwx_init_channel_map(sc, NULL, resp->channels, channels);
+    if (sc->sc_ic.ic_native_controlled) {
+        struct ieee80211com *ic = &sc->sc_ic;
+        if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
+            ic->ic_bss->ni_chan && !ic->ic_bss->ni_chan->ic_flags) {
+            err = EOPNOTSUPP;
+            goto out;
+        }
+        memset(ic->ic_chan_avail, 0, sizeof(ic->ic_chan_avail));
+        for (unsigned ch = 1; ch < nitems(ic->ic_channels); ++ch)
+            if (ic->ic_channels[ch].ic_flags)
+                setbit(ic->ic_chan_avail, ch);
+        if (ieee80211_setmode(ic,
+                static_cast<enum ieee80211_phymode>(ic->ic_curmode)))
+            memset(ic->ic_chan_active, 0, sizeof(ic->ic_chan_active));
+        sc->sc_fw_mcc[0] = actualMcc >> 8;
+        sc->sc_fw_mcc[1] = actualMcc & 0xff;
+        sc->sc_fw_mcc[2] = 0;
+        sc->sc_fw_mcc_int = htole16(actualMcc);
+        nativeMccFailed = false;
+        // A native startup GET_CURRENT must also refresh the native cache.
+        if (!sequence && nativeRegulatoryReady() && ic->ic_event_handler)
+            (*ic->ic_event_handler)(ic, IEEE80211_EVT_COUNTRY_CODE_UPDATE, NULL);
+    }
     
 out:
     iwx_free_resp(sc, &hcmd);
@@ -10220,6 +12038,8 @@ iwx_init(struct _ifnet *ifp)
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
     generation = ++sc->sc_generation;
+    if (ic->ic_native_controlled)
+        ++ic->ic_native_core_generation;
     
     //    KASSERT(sc->task_refs.refs == 0);
     //    refcnt_init(&sc->task_refs);
@@ -10242,7 +12062,13 @@ iwx_init(struct _ifnet *ifp)
     
     ifq_clr_oactive(&ifp->if_snd);
     ifq_flush(&ifp->if_snd);
+    if (ic->ic_native_controlled &&
+        (generation != sc->sc_generation || nativeQuiescing))
+        return ENXIO;
     ifp->if_flags |= IFF_RUNNING;
+    publishNativeCoreState(sc, IEEE80211_NATIVE_CORE_READY, 0);
+    if (ic->ic_native_controlled && nativeMccPending)
+        iwx_add_task(sc, systq, &nativeMccRefreshTask);
     
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         ic->ic_bss->ni_chan = ic->ic_ibss_chan;
@@ -10256,16 +12082,14 @@ iwx_init(struct _ifnet *ifp)
      * ieee80211_begin_scan() ends up scheduling iwx_newstate_task().
      * Wait until the transition to SCAN state has completed.
      */
-    do {
-        err = tsleep_nsec(&ic->ic_state, PCATCH, "iwxinit",
-            SEC_TO_NSEC(1));
-        if (generation != sc->sc_generation)
-            return ENXIO;
-        if (err) {
+    err = iwx_wait_fw_state(sc, &ic->ic_state,
+        NULL, ~0,
+        IEEE80211_S_SCAN, SEC_TO_NSEC(1));
+    if (err) {
+        if (generation == sc->sc_generation)
             iwx_stop(ifp);
-            return err;
-        }
-    } while (ic->ic_state != IEEE80211_S_SCAN);
+        return err;
+    }
     
     return 0;
 }
@@ -10305,7 +12129,7 @@ _iwx_start_task(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3
             goto sendit;
         }
         
-        if (
+        if ((ic->ic_native_controlled && !that->nativeDataOutputReady()) ||
 #ifndef AIRPORT
             ic->ic_state != IEEE80211_S_RUN ||
 #endif
@@ -10365,10 +12189,83 @@ iwx_stop(struct _ifnet *ifp)
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
     int i, s = splnet();
+
+    const bool native = ic->ic_native_controlled;
+    if (native && !getMainWorkLoop()->inGate()) {
+        getMainCommandGate()->runAction(nativeStopGated, this);
+        splx(s);
+        return;
+    }
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    if (native && nativeStopOwner == current_thread()) {
+        splx(s);
+        return;
+    }
+    if (native && nativeStopInProgress) {
+        // Internal task frames unwind; foreign callers join the real stop.
+        if (!taskq_is_current(systq) && !taskq_is_current(sc->sc_nswq)) {
+            while (nativeStopInProgress) {
+                AbsoluteTime deadline;
+                clock_interval_to_deadline(10, kMillisecondScale,
+                    reinterpret_cast<uint64_t *>(&deadline));
+                getMainCommandGate()->commandSleep(&nativeStopInProgress,
+                    deadline, THREAD_UNINT);
+            }
+        }
+        splx(s);
+        return;
+    }
+    if (native) {
+        // Guard every synchronous stop publication, including cancellation.
+        nativeStopOwner = current_thread();
+        nativeQuiescing = nativeStopInProgress = true;
+        if (nativeRecoveryActive &&
+            (nativeRecoveryStopOwner != current_thread() ||
+             nativeRecovery.state != IEEE80211_NATIVE_RESET_BEGIN))
+            cancelNativeRecovery(kIOReturnAborted);
+        clearNativeCurrentRates();
+#else
+    if (native && nativeRecoveryActive &&
+        (nativeRecoveryStopOwner != current_thread() ||
+         nativeRecovery.state != IEEE80211_NATIVE_RESET_BEGIN))
+        cancelNativeRecovery(kIOReturnAborted);
+    if (native && nativeStopInProgress) {
+        // A cancelled task must unwind so the first stop can drain it. Other
+        // external callers join the stop instead of claiming early completion.
+        if (!taskq_is_current(systq) && !taskq_is_current(sc->sc_nswq)) {
+            while (nativeStopInProgress) {
+                AbsoluteTime deadline;
+                clock_interval_to_deadline(10, kMillisecondScale,
+                    reinterpret_cast<uint64_t *>(&deadline));
+                getMainCommandGate()->commandSleep(&nativeStopInProgress,
+                    deadline, THREAD_UNINT);
+            }
+        }
+        splx(s);
+        return;
+    }
+    if (native) {
+        clearNativeCurrentRates();
+        nativeQuiescing = nativeStopInProgress = true;
+#endif
+        if (!++nativeEnableAttempt) ++nativeEnableAttempt;
+        nativeEnablePending = false;
+        nativeEnableResult = kIOReturnAborted;
+        // Close admission before cancelling pending work or waking sleepers.
+        // The generation invalidates every in-flight firmware command.
+        nativeTaskAdmission(false);
+        ++sc->sc_generation;
+        ++ic->ic_native_core_generation;
+        ifp->if_flags &= ~IFF_RUNNING;
+    }
     
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
     sc->sc_flags |= IWX_FLAG_SHUTDOWN; /* Disallow new tasks. */
+    if (nativeScanPending) {
+        nativeScanCancelled = true;
+        memset(&nativeScanProfile, 0, sizeof(nativeScanProfile));
+    }
     
     /* Cancel scheduled tasks and let any stale tasks finish up. */
     task_del(systq, &sc->init_task);
@@ -10376,10 +12273,40 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->ba_task);
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
     iwx_del_task(sc, systq, &sc->chan_ctxt_task);
+    if (native) {
+        iwx_del_task(sc, systq, &nativeMccRefreshTask);
+        nativeMccPending = false;
+        nativeMccBusy = 0;
+        ++nativeMccSequence;
+    }
     KASSERT(sc->task_refs.refs >= 1, "sc->task_refs.refs >= 1");
     //    refcnt_finalize(&sc->task_refs, "iwxstop");
     
+    if (native) {
+        // Stop DMA/firmware first. Keep rings, response buffers and callback
+        // recipients alive until every admitted worker has returned. A worker
+        // running this stop is excluded from its own barrier and resumes only
+        // after all other workers have left, under this same gate.
+        iwx_disable_interrupts(sc);
+        iwx_disable_rx_dma(sc);
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+        uint32_t reset = OSReadLittleInt32(sc->sc_sh, IWX_CSR_RESET);
+        OSWriteLittleInt32(sc->sc_sh, IWX_CSR_RESET,
+            reset | IWX_CSR_RESET_REG_FLAG_SW_RESET);
+        (void)OSReadLittleInt32(sc->sc_sh, IWX_CSR_RESET);
+#else
+        IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
+#endif
+        DELAY(5000);
+        for (unsigned waiter = 0; waiter < nitems(nativeWaiters); ++waiter)
+            if (nativeWaiters[waiter].thread)
+                getMainCommandGate()->commandWakeup(nativeWaiters[waiter].event, false);
+        nativeDrainTasks();
+    }
+    resetNativeKeys();
     iwx_stop_device(sc);
+    firmwareScanFinalPending = false;
+    finishNativeScan(kIOReturnAborted, 0);
     
     /* Reset soft state. */
     
@@ -10405,7 +12332,8 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_flags &= ~IWX_FLAG_STA_ACTIVE;
     sc->sc_flags &= ~IWX_FLAG_TE_ACTIVE;
     sc->sc_flags &= ~IWX_FLAG_HW_ERR;
-    sc->sc_flags &= ~IWX_FLAG_SHUTDOWN;
+    if (!native)
+        sc->sc_flags &= ~IWX_FLAG_SHUTDOWN;
     sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
 
     sc->sc_rx_ba_sessions = 0;
@@ -10414,7 +12342,10 @@ iwx_stop(struct _ifnet *ifp)
     sc->ba_tx.start_tidmask = 0;
     sc->ba_tx.stop_tidmask = 0;
     
-    sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+    // The child can still hold a raw scan-cache cursor during terminal stop.
+    // Final ifdetach after child stop owns that software/node destruction.
+    if (!isTearingDown())
+        sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
     sc->ns_nstate = IEEE80211_S_INIT;
     
     for (i = 0; i < nitems(sc->sc_rxba_data); i++) {
@@ -10423,6 +12354,32 @@ iwx_stop(struct _ifnet *ifp)
     }
     
     ifp->if_timer = sc->sc_tx_timer = 0;
+
+    if (native) {
+        // All registered sleepers, workers, DMA and key commands have drained.
+        if (nativeRecoveryNeedsQuiescence) {
+            nativeRecoveryNeedsQuiescence = false;
+            publishNativeRecovery(IEEE80211_NATIVE_RESET_QUIESCED,
+                nativeRecoveryActive ? kIOReturnSuccess : kIOReturnAborted);
+        }
+        publishNativeCoreState(sc, IEEE80211_NATIVE_CORE_OFF, 0);
+#if __IO80211_TARGET < __MAC_15_0 || defined(AIRITL_ENABLE_BSDIF)
+        nativeStopInProgress = false;
+        getMainCommandGate()->commandWakeup(&nativeStopInProgress, false);
+#endif
+        // Internal recovery calls stop from init_task with IFF_UP retained.
+        // External disable clears IFF_UP and keeps admission closed until enable.
+        if (ifp->if_flags & IFF_UP) {
+            nativeQuiescing = false;
+            sc->sc_flags &= ~IWX_FLAG_SHUTDOWN;
+            nativeTaskAdmission(true);
+        }
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+        nativeStopOwner = NULL;
+        nativeStopInProgress = false;
+        getMainCommandGate()->commandWakeup(&nativeStopInProgress, false);
+#endif
+    }
     
     splx(s);
 }
@@ -10462,6 +12419,12 @@ iwx_watchdog(struct _ifnet *ifp)
         ifp->if_timer = 1;
     }
 
+    if (sc->sc_ic.ic_native_controlled) {
+        that->expireNativeKeys();
+        for (unsigned i = 0; i < nitems(that->nativeKeyInstalls); ++i)
+            if (that->nativeKeyInstalls[i].active)
+                ifp->if_timer = 1;
+    }
     ieee80211_watchdog(ifp);
 }
 
@@ -10845,13 +12808,19 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
          * LEGACY group. Firmware API versions >= 50 reject commands
          * in group 0, forcing us to use this hack.
          */
-        if (iwx_cmd_groupid(code) == IWX_LONG_GROUP) {
+        if (iwx_cmd_groupid(code) == IWX_LONG_GROUP &&
+            qid == IWX_DQA_CMD_QUEUE && idx < sc->txq[qid].ring_count) {
             struct iwx_tx_ring *ring = &sc->txq[qid];
             struct iwx_tx_data *txdata = &ring->data[idx];
             if (txdata->flags & IWX_TXDATA_FLAG_CMD_IS_NARROW)
                 code = iwx_cmd_opcode(code);
         }
         
+        if (sc->sc_ic.ic_native_controlled && qid == IWX_DQA_CMD_QUEUE &&
+            pkt->hdr.cmd == IWX_ADD_STA_KEY &&
+            ((pkt->hdr.group_id & ~IWX_CMD_FAILED_MSK) == IWX_LONG_GROUP ||
+             (pkt->hdr.group_id & ~IWX_CMD_FAILED_MSK) == 0))
+            code = IWX_ADD_STA_KEY;
         len = sizeof(pkt->len_n_flags) + iwx_rx_packet_len(pkt);
         if (len < minsz || len > (IWX_RBUF_SIZE - offset))
             break;
@@ -10965,6 +12934,10 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 break;
             }
                 
+            case IWX_BT_PROFILE_NOTIFICATION:
+                iwx_bt_coex_notif(sc, pkt);
+                break;
+
             case IWX_STATISTICS_NOTIFICATION: {
                 struct iwx_notif_statistics *stats;
                 struct iwx_notif_statistics_v11 *stats_v11;
@@ -11000,6 +12973,9 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP,
                 IWX_NVM_GET_INFO):
             case IWX_ADD_STA_KEY:
+                if (sc->sc_ic.ic_native_controlled)
+                    nativeKeyResponse(pkt, qid, idx);
+                /* FALLTHROUGH */
             case IWX_PHY_CONFIGURATION_CMD:
             case IWX_TX_ANT_CONFIGURATION_CMD:
             case IWX_ADD_STA:
@@ -11019,6 +12995,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_REMOVE_STA:
             case IWX_TXPATH_FLUSH:
             case IWX_BT_CONFIG:
+            case IWX_BT_COEX_CI:
             case IWX_MCC_UPDATE_CMD:
             case IWX_TIME_EVENT_CMD:
             case IWX_STATISTICS_CMD:
@@ -11048,12 +13025,17 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 break;
             }
                 
-            case IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP, IWX_PNVM_INIT_COMPLETE_NTFY):
-                wakeupOn(&sc->sc_init_complete);
+            case IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP, IWX_PNVM_INIT_COMPLETE_NTFY): {
                 struct iwl_pnvm_init_complete_ntfy *pnvm_ntf;
+                if (iwx_rx_packet_payload_len(pkt) < sizeof(*pnvm_ntf))
+                    break;
                 SYNC_RESP_STRUCT(pnvm_ntf, pkt, struct iwl_pnvm_init_complete_ntfy *);
-                XYLog("PNVM complete notification received with status 0x%0x\n", le32toh(pnvm_ntf->status));
+                pnvmStatus = le32toh(pnvm_ntf->status);
+                pnvmComplete = 1;
+                wakeupOn(&pnvmComplete);
+                AIRITL_DBG("PNVM complete notification received with status 0x%0x\n", pnvmStatus);
                 break;
+            }
                 
             case IWX_INIT_COMPLETE_NOTIF:
                 sc->sc_init_complete |= IWX_INIT_COMPLETE;
@@ -11062,20 +13044,50 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 
             case IWX_SCAN_COMPLETE_UMAC: {
                 struct iwx_umac_scan_complete *notif;
+                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif))
+                    break;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
-                iwx_endscan(sc);
+                const uint32_t uid = le32toh(notif->uid);
+                if (uid == 0) {
+                    firmwareScanFinalPending = false;
+                    wakeupOn(&firmwareScanFinalPending);
+                }
+                if (nativeScanPending) {
+                    if (uid != nativeScanUID)
+                        break;
+                    IOReturn status = kIOReturnError;
+                    if (nativeScanCancelled || notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                        status = kIOReturnAborted;
+                    else if (notif->status == IWX_SCAN_OFFLOAD_COMPLETED)
+                        status = kIOReturnSuccess;
+                    if (nativeMccBusy) {
+                        nativeMccScanDeferred = true;
+                        nativeMccScanStatus = status;
+                        nativeMccScanFirmwareStatus = notif->status;
+                    } else
+                        finishNativeScan(nativeMccFailed ? kIOReturnError : status,
+                            notif->status);
+                } else if (uid == 0)
+                    iwx_endscan(sc);
                 break;
             }
                 
             case IWX_SCAN_ITERATION_COMPLETE_UMAC: {
                 struct iwx_umac_scan_iter_complete_notif *notif;
+                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif))
+                    break;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_iter_complete_notif *);
-                iwx_endscan(sc);
+                // Iteration status has a different enum and is not terminal.
+                // Native requests wait for SCAN_COMPLETE_UMAC with the same UID.
+                if (!nativeScanPending && le32toh(notif->uid) == 0)
+                    iwx_endscan(sc);
                 break;
             }
                 
             case IWX_MCC_CHUB_UPDATE_CMD: {
                 struct iwx_mcc_chub_notif *notif;
+                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif))
+                    break;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_mcc_chub_notif *);
                 iwx_mcc_update(sc, notif);
                 break;
@@ -12713,7 +14725,6 @@ iwx_preinit(struct iwx_softc *sc)
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = IC2IFP(ic);
     int err;
-    static int attached;
     
     err = iwx_prepare_card_hw(sc);
     if (err) {
@@ -12721,7 +14732,7 @@ iwx_preinit(struct iwx_softc *sc)
         return err;
     }
     
-    if (attached) {
+    if (preinitComplete) {
         /* Update MAC in case the upper layers changed it. */
         IEEE80211_ADDR_COPY(sc->sc_ic.ic_myaddr,
                             ((struct arpcom *)ifp)->ac_enaddr);
@@ -12740,7 +14751,6 @@ iwx_preinit(struct iwx_softc *sc)
         return err;
     
     /* Print version info and MAC address on first successful fw load. */
-    attached = 1;
     XYLog("%s: hw rev 0x%x, fw ver %s, address %s\n",
           DEVNAME(sc), sc->sc_hw_rev & IWX_CSR_HW_REV_TYPE_MSK,
           sc->sc_fwver, ether_sprintf(sc->sc_nvm.hw_addr));
@@ -12769,7 +14779,7 @@ iwx_preinit(struct iwx_softc *sc)
                 DEVNAME(sc), err);
     
     ieee80211_media_init(ifp);
-    
+    preinitComplete = true;
     return 0;
 }
 
@@ -12811,7 +14821,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
               DEVNAME(sc));
         return false;
     }
-    
+
     /* Clear device-specific "PCI retry timeout" register (41h). */
     reg = pci_conf_read(sc->sc_pct, sc->sc_pcitag, 0x40);
     pci_conf_write(sc->sc_pct, sc->sc_pcitag, 0x40, reg & ~0xff00);
@@ -12824,7 +14834,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         reg &= ~PCI_COMMAND_INTERRUPT_DISABLE;
     }
     pci_conf_write(sc->sc_pct, sc->sc_pcitag, PCI_COMMAND_STATUS_REG, reg);
-    
+
     memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, PCI_MAPREG_START);
     err = pci_mapreg_map(pa, PCI_MAPREG_START, memtype, 0,
                          &sc->sc_st, &sc->sc_sh, NULL, &sc->sc_sz, 0);
@@ -12868,6 +14878,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         return false;
     }
 
+    acquireInterruptSourceLease();
     if (sc->sc_msix)
         sc->sc_ih =
         IOFilterInterruptEventSource::filterInterruptEventSource(this,
@@ -13032,7 +15043,8 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         goto fail4;
     }
     
-    taskq_init();
+    if (!taskq_init())
+        goto fail4;
     sc->sc_nswq = taskq_create("iwxns", 1, IPL_NET, 0);
     if (sc->sc_nswq == NULL)
         goto fail4;
@@ -13101,15 +15113,17 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         for (j = 0; j < nitems(rxba->entries); j++)
         ml_init(&rxba->entries[j].frames);
     }
-    task_set(&sc->init_task, iwx_init_task, sc, "iwx_init_task");
-    task_set(&sc->newstate_task, iwx_newstate_task, sc, "iwx_newstate_task");
-    task_set(&sc->ba_task, iwx_ba_task, sc, "iwx_ba_task");
-    task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");
-    task_set(&sc->chan_ctxt_task, iwx_chan_ctxt_task, sc, "iwx_chan_ctxt_task");
+    task_set(&sc->init_task, nativeInitTask, sc, "iwx_init_task");
+    task_set(&sc->newstate_task, nativeNewstateTask, sc, "iwx_newstate_task");
+    task_set(&sc->ba_task, nativeBATask, sc, "iwx_ba_task");
+    task_set(&sc->mac_ctxt_task, nativeMacTask, sc, "iwx_mac_ctxt_task");
+    task_set(&sc->chan_ctxt_task, nativeChanTask, sc, "iwx_chan_ctxt_task");
+    task_set(&nativeMccRefreshTask, nativeMccTaskEntry, sc, "iwx_mcc_task");
     
     ic->ic_node_alloc = iwx_node_alloc;
-    ic->ic_bgscan_start = iwx_bgscan;
+    ic->ic_bgscan_start = NULL;
     ic->ic_set_key = iwx_set_key;
+    ic->ic_key_ready = iwx_key_ready;
     ic->ic_delete_key = iwx_delete_key;
     
     /* Override 802.11 state transition machine. */
@@ -13177,22 +15191,71 @@ iwx_init_task(void *arg1)
     int s = splnet();
     int generation = sc->sc_generation;
     int fatal = (sc->sc_flags & (IWX_FLAG_HW_ERR | IWX_FLAG_RFKILL));
-    
+    // Capture before stop/init can sleep. Never complete a successor attempt.
+    uint64_t enableAttempt = that->nativeEnableAttempt;
+    IOReturn enableResult = kIOReturnNotReady;
+
     //    rw_enter_write(&sc->ioctl_rwl);
     if (generation != sc->sc_generation) {
         //        rw_exit(&sc->ioctl_rwl);
         splx(s);
         return;
     }
-    
-    if (ifp->if_flags & IFF_RUNNING)
+
+    uint64_t recovery = 0;
+    if (ifp->if_flags & IFF_RUNNING) {
+        recovery = that->beginNativeRecovery();
+        if (sc->sc_ic.ic_native_controlled && !recovery) {
+            splx(s);
+            return;
+        }
         that->iwx_stop(ifp);
-    else
+        if (that->nativeRecovery.identity == recovery)
+            that->nativeRecoveryStopOwner = NULL;
+    } else
         sc->sc_flags &= ~IWX_FLAG_HW_ERR;
-    
-    if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
-        that->iwx_init(ifp);
-    
+
+    if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {
+        // Internal reload retains IFF_UP after stop. Give this actual init a
+        // fresh identity; the stopped attempt can never complete this one.
+        if (sc->sc_ic.ic_native_controlled && !that->nativeQuiescing &&
+            !that->nativeEnablePending) {
+            if (!++that->nativeEnableAttempt) ++that->nativeEnableAttempt;
+            enableAttempt = that->nativeEnableAttempt;
+            that->nativeEnablePending = true;
+            that->nativeEnableResult = kIOReturnNotReady;
+        }
+        const uint64_t coreGeneration = sc->sc_ic.ic_native_core_generation + 1;
+        if (recovery && that->nativeRecoveryActive &&
+            that->nativeRecovery.identity == recovery) {
+            that->nativeRecovery.enable_attempt = enableAttempt;
+            that->nativeRecovery.reload_generation = coreGeneration;
+            that->publishNativeRecovery(IEEE80211_NATIVE_RESET_RELOADING, kIOReturnSuccess);
+        }
+        int error = that->iwx_init(ifp);
+        enableResult = error ? kIOReturnError : kIOReturnSuccess;
+        if (error && sc->sc_ic.ic_native_controlled && !that->nativeQuiescing &&
+            sc->sc_ic.ic_native_core_generation == coreGeneration &&
+            !(ifp->if_flags & IFF_RUNNING))
+            that->publishNativeCoreState(sc, IEEE80211_NATIVE_CORE_FAILED, error);
+    }
+
+    if (sc->sc_ic.ic_native_controlled) {
+        that->completeNativeEnable(enableAttempt, enableResult);
+        if (recovery && that->nativeRecoveryActive &&
+            that->nativeRecovery.identity == recovery) {
+            if (that->nativeRecovery.enable_attempt != enableAttempt ||
+                enableResult != kIOReturnSuccess)
+                that->cancelNativeRecovery(enableResult);
+            else {
+                // iwx_init has returned after its SCAN wait. Pin the actual
+                // hardware generation now, then await any pending MCC owner.
+                that->nativeRecovery.hardware_generation = sc->sc_generation;
+                that->nativeRecoveryInitFinished = true;
+                that->tryCompleteNativeRecovery();
+            }
+        }
+    }
     //    rw_exit(&sc->ioctl_rwl);
     splx(s);
 }

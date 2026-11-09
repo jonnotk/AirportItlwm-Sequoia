@@ -80,6 +80,7 @@ ieee80211_crypto_attach(struct _ifnet *ifp)
         ic->ic_rsngroupmgmtcipher = IEEE80211_CIPHER_BIP;
     }
     ic->ic_set_key = ieee80211_set_key;
+    ic->ic_key_ready = NULL;
     ic->ic_delete_key = ieee80211_delete_key;
 #ifndef IEEE80211_STA_ONLY
     timeout_set(&ic->ic_tkip_micfail_timeout,
@@ -204,6 +205,80 @@ ieee80211_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
         break;
     }
     explicit_bzero(k, sizeof(*k));
+}
+
+/* Host ownership only. Iwx retains command-index quarantine until ACK/drain. */
+void
+ieee80211_clear_native_bss_keys(struct ieee80211com *ic,
+    const struct ieee80211_node *source)
+{
+    struct ieee80211_node *ni = ic->ic_bss;
+    if (!ic->ic_native_controlled || ic->ic_opmode != IEEE80211_M_STA ||
+        ni == NULL)
+        return;
+
+    ni->ni_port_valid = 0;
+    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    if (source != ni && source != NULL &&
+        ni->ni_eapol_to == source->ni_eapol_to)
+        ni->ni_eapol_to = NULL;
+    else {
+        timeout_del(&ni->ni_eapol_to);
+        timeout_free(&ni->ni_eapol_to);
+    }
+    if (source != ni && source != NULL &&
+        ni->ni_sa_query_to == source->ni_sa_query_to)
+        ni->ni_sa_query_to = NULL;
+    else {
+        timeout_del(&ni->ni_sa_query_to);
+        timeout_free(&ni->ni_sa_query_to);
+    }
+    if (source != ni && source != NULL &&
+        ni->ni_pairwise_key.k_priv == source->ni_pairwise_key.k_priv)
+        ni->ni_pairwise_key.k_priv = NULL;
+    ieee80211_delete_key(ic, ni, &ni->ni_pairwise_key);
+    for (unsigned i = 0; i < nitems(ic->ic_nw_keys); i++) {
+        if (source != ni && source != NULL &&
+            ic->ic_nw_keys[i].k_priv == source->ni_pairwise_key.k_priv)
+            ic->ic_nw_keys[i].k_priv = NULL;
+        ieee80211_delete_key(ic, ni, &ic->ic_nw_keys[i]);
+    }
+}
+
+void
+ieee80211_reset_native_bss_security(struct ieee80211com *ic,
+    struct ieee80211_node *ni)
+{
+    if (!ic->ic_native_controlled || ic->ic_opmode != IEEE80211_M_STA ||
+        ni == NULL || ni != ic->ic_bss)
+        return;
+
+    /* These pointers were borrowed by struct copy. Their source still owns them. */
+    explicit_bzero(&ni->ni_pairwise_key, sizeof(ni->ni_pairwise_key));
+    ni->ni_eapol_to = NULL;
+    ni->ni_sa_query_to = NULL;
+    explicit_bzero(&ni->ni_ptk, sizeof(ni->ni_ptk));
+    explicit_bzero(ni->ni_pmk, sizeof(ni->ni_pmk));
+    explicit_bzero(ni->ni_pmkid, sizeof(ni->ni_pmkid));
+    explicit_bzero(ni->ni_nonce, sizeof(ni->ni_nonce));
+    explicit_bzero(ic->ic_nonce, sizeof(ic->ic_nonce));
+    ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT |
+        IEEE80211_NODE_TXMGMTPROT | IEEE80211_NODE_RXMGMTPROT |
+        IEEE80211_NODE_MFP | IEEE80211_NODE_PMK | IEEE80211_NODE_PMKID |
+        IEEE80211_NODE_RSN_NEW_PTK | IEEE80211_NODE_REKEY |
+        IEEE80211_NODE_SA_QUERY | IEEE80211_NODE_SA_QUERY_FAILED);
+    ni->ni_port_valid = 0;
+    ni->ni_replaycnt = 0;
+    ni->ni_replaycnt_ok = 0;
+    ni->ni_reqreplaycnt = 0;
+    ni->ni_reqreplaycnt_ok = 0;
+    ni->ni_key_count = 0;
+    ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
+    ni->ni_rsn_state = RSNA_INITIALIZE;
+    ni->ni_rsn_gstate = RSNA_IDLE;
+    ni->ni_rsn_retries = 0;
+    ni->ni_sa_query_count = 0;
+    ni->ni_sa_query_trid = 0;
 }
 
 struct ieee80211_key *
@@ -407,8 +482,6 @@ ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
     const u_int8_t *aa, const u_int8_t *spa, const u_int8_t *anonce,
     const u_int8_t *snonce, struct ieee80211_ptk *ptk)
 {
-	void (*kdf)(const u_int8_t *, size_t, const u_int8_t *, size_t,
-        const u_int8_t *, size_t, u_int8_t *, size_t);
     u_int8_t buf[2 * IEEE80211_ADDR_LEN + 2 * EAPOL_KEY_NONCE_LEN];
     int ret;
 
@@ -422,9 +495,17 @@ ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
     memcpy(&buf[12], ret ? anonce : snonce, EAPOL_KEY_NONCE_LEN);
     memcpy(&buf[44], ret ? snonce : anonce, EAPOL_KEY_NONCE_LEN);
 
-    kdf = ieee80211_is_sha256_akm(akm) ? ieee80211_kdf : ieee80211_prf;
-    (*kdf)(pmk, IEEE80211_PMK_LEN, (const u_int8_t *)"Pairwise key expansion", 23,
-        buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+    if (ieee80211_is_sha256_akm(akm)) {
+        /* SHA256 omits the label NUL and hashes the 48-byte CCMP PTK length. */
+        memset(ptk, 0, sizeof(*ptk));
+        ieee80211_kdf(pmk, IEEE80211_PMK_LEN,
+            (const u_int8_t *)"Pairwise key expansion", 22,
+            buf, sizeof buf, (u_int8_t *)ptk, 48);
+    } else {
+        ieee80211_prf(pmk, IEEE80211_PMK_LEN,
+            (const u_int8_t *)"Pairwise key expansion", 23,
+            buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+    }
 }
 
 static void

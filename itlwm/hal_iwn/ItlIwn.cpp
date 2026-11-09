@@ -82,14 +82,75 @@ bool ItlIwn::attach(IOPCIDevice *device)
         releaseAll();
         return false;
     }
+    deviceAttachComplete = true;
+    return true;
+}
+
+bool ItlIwn::quiesceForDetach()
+{
+    if (detachQuiesced) {
+        if (taskq_is_current(systq)) {
+            quarantineTeardown();
+            return false;
+        }
+        return true;
+    }
+    if (!getMainWorkLoop() || !getMainCommandGate()) {
+        teardownStartedBeforeBinding();
+        bool pristine = !com.sc_st && !com.sc_ih && !deviceAttachComplete;
+        if (!pristine)
+            quarantineTeardown();
+        return pristine;
+    }
+    if (!getMainWorkLoop()->inGate())
+        return getMainCommandGate()->runAction(quiesceGated, static_cast<ItlHalService *>(this)) == kIOReturnSuccess;
+
+    bool timerAdmissionClosed = beginTeardown();
+    struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    struct iwn_softc *sc = &com;
+
+    // The init task can wait for firmware IRQs. Join it before removal.
+    taskq_suspend_task(systq, &com.init_task);
+    // The task barrier excludes its caller, but final queue destruction cannot.
+    // A self-worker cleanup must leave its callback dependencies retained.
+    if (taskq_is_current(systq)) {
+        quarantineTeardown();
+        return false;
+    }
+    if (!timerAdmissionClosed) {
+        IOLog("itlwm: timer admission publication failed; retaining device resources\n");
+        return false;
+    }
+    if (getMainCommandGate()->runAction(CTimeout::quiesceControllerTimers) != kIOReturnSuccess) {
+        quarantineTeardown();
+        return false;
+    }
+    IOCommandGate *gate = getMainWorkLoop()->inGate() ? getMainCommandGate() : NULL;
+    taskq_del_barrier_gated(systq, &com.init_task, gate);
+    // Only a successful attach still owns the complete DMA ring set.
+    if (deviceAttachComplete && com.sc_st)
+        iwn_hw_stop(sc);
+    deviceAttachComplete = false;
+    if (!releaseInterruptSource(com.sc_ih))
+        return false;
+    detachQuiesced = true;
     return true;
 }
 
 void ItlIwn::
 detach(IOPCIDevice *device)
 {
+    if (detachComplete || !quiesceForDetach())
+        return;
+    if (!getMainWorkLoop() || !getMainCommandGate()) {
+        releaseAll();
+        detachComplete = true;
+        return;
+    }
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
     struct iwn_softc *sc = &com;
+
+
     
     for (int txq_i = 0; txq_i < nitems(sc->txq); txq_i++)
         iwn_free_tx_ring(sc, &sc->txq[txq_i]);
@@ -99,13 +160,20 @@ detach(IOPCIDevice *device)
     iwn_free_kw(sc);
     iwn_free_fwmem(sc);
     ieee80211_ifdetach(ifp);
+    timeout_del(&com.calib_to);
+    timeout_free(&com.calib_to);
     taskq_destroy(systq);
     releaseAll();
+    detachComplete = true;
 }
 
 void ItlIwn::
 releaseAll()
 {
+    if (isTearingDown() && teardownMustRetainResources())
+        return;
+    if (!releaseInterruptSource(com.sc_ih))
+        return;
     pci_intr_handle *intrHandler = com.ih;
     
     if (com.calib_to) {
@@ -126,6 +194,10 @@ releaseAll()
         intrHandler->release();
         com.ih = NULL;
     }
+    // Callback and task users have drained before their BAR mapping goes away.
+    OSSafeReleaseNULL(com.sc_st);
+    com.sc_sh = NULL;
+    com.sc_sz = 0;
     pci.pa_tag = NULL;
     pci.workloop = NULL;
 }
@@ -133,6 +205,7 @@ releaseAll()
 void ItlIwn::free()
 {
     XYLog("%s\n", __FUNCTION__);
+    releaseAll();
     super::free();
 }
 
@@ -150,6 +223,8 @@ getDriverController()
 
 IOReturn ItlIwn::enable(IONetworkInterface *netif)
 {
+    if (isTearingDown() || !getMainWorkLoop() || !deviceAttachComplete)
+        return kIOReturnNotReady;
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
     if (ifp->if_flags & IFF_UP) {
@@ -411,6 +486,7 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
         return false;
     }
 
+    acquireInterruptSourceLease();
     sc->sc_ih = IOFilterInterruptEventSource::filterInterruptEventSource(this,
                                                                          (IOInterruptEventSource::Action)&ItlIwn::iwn_intr, &ItlIwn::intrFilter
                                                                          ,pa->pa_tag, msiIntrIndex);
@@ -497,7 +573,8 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
     XYLog(", MIMO %dT%dR, %.4s, address %s\n", sc->ntxchains,
         sc->nrxchains, sc->eeprom_domain, ether_sprintf(ic->ic_myaddr));
 
-    taskq_init();
+    if (!taskq_init())
+        goto fail4;
     
     ic->ic_phytype = IEEE80211_T_OFDM;    /* not only, but not used */
     ic->ic_opmode = IEEE80211_M_STA;    /* default to BSS mode */
@@ -2859,7 +2936,10 @@ iwn_clear_oactive(struct iwn_softc *sc, struct iwn_tx_ring *ring)
             (*ifp->if_start)(ifp);
         }
 #ifdef __PRIVATE_SPI__
-        ifp->iface->signalOutputThread();
+        if (ifp->native_output_ready)
+            ifp->native_output_ready(ifp->native_input_context);
+        else if (ifp->iface)
+            ifp->iface->signalOutputThread();
 #endif
     }
 }

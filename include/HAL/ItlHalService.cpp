@@ -13,6 +13,7 @@
 */
 
 #include "ItlHalService.hpp"
+#include <sys/CTimeout.hpp>
 
 #define super OSObject
 OSDefineMetaClassAndAbstractStructors(ItlHalService, OSObject)
@@ -20,16 +21,39 @@ OSDefineMetaClassAndAbstractStructors(ItlHalService, OSObject)
 bool ItlHalService::
 initWithController(IOEthernetController *controller, IOWorkLoop *workloop, IOCommandGate *commandGate)
 {
+    if (teardownStarted || !controller || !workloop || !commandGate ||
+        controller->getProperty("ItlwmTeardown") == kOSBooleanTrue || this->controller ||
+        mainWorkLoop || mainCommandGate || inner_attr || inner_gp_attr ||
+        inner_gp || inner_lock)
+        return false;
+    if (!super::init())
+        return false;
+    inner_attr = lck_attr_alloc_init();
+    if (!inner_attr)
+        return false;
+    inner_gp_attr = lck_grp_attr_alloc_init();
+    if (inner_gp_attr)
+        inner_gp = lck_grp_alloc_init("itlwm_tsleep", inner_gp_attr);
+    if (inner_gp)
+        inner_lock = lck_mtx_alloc_init(inner_gp, inner_attr);
+    if (!inner_lock || !controller->setProperty("ItlwmTeardown", kOSBooleanFalse) ||
+        !CTimeout::initializeControllerTimers(controller)) {
+        if (inner_lock) lck_mtx_free(inner_lock, inner_gp);
+        inner_lock = NULL;
+        if (inner_gp) lck_grp_free(inner_gp);
+        if (inner_gp_attr) lck_grp_attr_free(inner_gp_attr);
+        lck_attr_free(inner_attr);
+        inner_gp = NULL;
+        inner_gp_attr = NULL;
+        inner_attr = NULL;
+        return false;
+    }
     this->controller = controller;
-    this->controller->retain();
-    this->mainWorkLoop = workloop;
-    this->mainWorkLoop->retain();
-    this->mainCommandGate = commandGate;
-    this->mainCommandGate->retain();
-    this->inner_attr = lck_attr_alloc_init();
-    this->inner_gp_attr = lck_grp_attr_alloc_init();
-    this->inner_gp = lck_grp_alloc_init("itlwm_tsleep", this->inner_gp_attr);
-    this->inner_lock = lck_mtx_alloc_init(this->inner_gp, this->inner_attr);
+    controller->retain();
+    mainWorkLoop = workloop;
+    workloop->retain();
+    mainCommandGate = commandGate;
+    commandGate->retain();
     return true;
 }
 
@@ -87,13 +111,69 @@ free()
     if (this->controller) {
         this->controller->release();
     }
-    if (this->inner_lock) {
-        lck_attr_free(this->inner_attr);
-        lck_mtx_free(this->inner_lock, this->inner_gp);
-        lck_grp_free(this->inner_gp);
-        lck_grp_attr_free(this->inner_gp_attr);
-        this->inner_lock = NULL;
-    }
+    if (inner_lock) lck_mtx_free(inner_lock, inner_gp);
+    if (inner_gp) lck_grp_free(inner_gp);
+    if (inner_gp_attr) lck_grp_attr_free(inner_gp_attr);
+    if (inner_attr) lck_attr_free(inner_attr);
+    inner_lock = NULL;
+    inner_gp = NULL;
+    inner_gp_attr = NULL;
+    inner_attr = NULL;
     this->controller = NULL;
     super::free();
+}
+
+void ItlHalService::acquireInterruptSourceLease()
+{
+    if (!interruptSourceLease) {
+        retain();
+        interruptSourceLease = true;
+    }
+}
+
+bool ItlHalService::releaseInterruptSource(IOInterruptEventSource *&source)
+{
+    IOInterruptEventSource *interrupt = source;
+    if (interrupt) {
+        interrupt->disable();
+        IOWorkLoop *workloop = interrupt->getWorkLoop();
+        if (workloop && workloop->removeEventSource(interrupt) != kIOReturnSuccess) {
+            teardownQuarantined = true;
+            IOLog("itlwm: interrupt removal failed; retaining HAL and device resources\n");
+            return false;
+        }
+        source = NULL;
+        // Removal unregisters the provider interrupt. Keep the HAL lease and
+        // mapped registers alive until the final source release also completes.
+        interrupt->release();
+    }
+    if (interruptSourceLease) {
+        interruptSourceLease = false;
+        release();
+    }
+    return true;
+}
+
+bool ItlHalService::beginTeardown()
+{
+    teardownStarted = true;
+    if (controller && controller->setProperty("ItlwmTeardown", kOSBooleanTrue))
+        return true;
+    quarantineTeardown();
+    return false;
+}
+
+void ItlHalService::quarantineTeardown()
+{
+    teardownQuarantined = true;
+    if (!teardownQuarantineLease) {
+        retain();
+        teardownQuarantineLease = true;
+    }
+}
+
+IOReturn ItlHalService::quiesceGated(OSObject *, void *arg, void *, void *, void *)
+{
+    ItlHalService *self = static_cast<ItlHalService *>(arg);
+    return self && self->quiesceForDetach() ? kIOReturnSuccess : kIOReturnNotReady;
 }

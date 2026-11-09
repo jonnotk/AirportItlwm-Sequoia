@@ -729,6 +729,15 @@ struct iwx_softc {
 	/* phy contexts.  we only use the first one */
 	struct iwx_phy_ctxt sc_phyctxt[IWX_NUM_PHY_CTX];
 
+	/* BT coex: last channel-inhibition command sent and last BT activity. */
+	struct iwx_bt_coex_ci_cmd sc_last_bt_ci;
+	uint32_t sc_bt_activity;
+	uint32_t sc_bt_notif_count;
+	/* BT coex SMPS (Linux iwl_mvm_bt_notif_per_link): wanted from the BT report, applied by chan_ctxt_task. */
+	uint8_t sc_bt_smps_wanted;
+	uint8_t sc_bt_smps_applied;
+	uint8_t sc_bt_rrc;
+
 	int sc_noise;
 
     int sc_pm_support;

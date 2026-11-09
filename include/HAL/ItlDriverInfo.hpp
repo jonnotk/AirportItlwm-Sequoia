@@ -34,6 +34,10 @@ public:
     virtual const char *getFirmwareCountryCode() = 0;
 
     virtual uint32_t getTxQueueSize() = 0;
+
+    // Spatial streams allowed while Bluetooth coex is active
+    // (Apple getMAX_NSS_FOR_AP / btc_nss). Default: no coex limit.
+    virtual int getBtCoexMaxNSS() { return getTxNSS(); }
 };
 
 #endif /* ItlDriverInfo_h */

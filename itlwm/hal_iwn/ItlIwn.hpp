@@ -79,6 +79,7 @@ public:
     void free() override;
     virtual bool attach(IOPCIDevice *device) override;
     virtual void detach(IOPCIDevice *device) override;
+    virtual bool quiesceForDetach() override;
     IOReturn enable(IONetworkInterface *netif) override;
     IOReturn disable(IONetworkInterface *netif) override;
     virtual struct ieee80211com *get80211Controller() override;
@@ -317,8 +318,8 @@ public:
     
 public:
     IOInterruptEventSource* fInterrupt;
-    struct pci_attach_args pci;
-    struct iwn_softc com;
+    struct pci_attach_args pci = {};
+    struct iwn_softc com = {};
 };
 
 #endif

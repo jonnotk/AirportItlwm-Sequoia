@@ -160,6 +160,10 @@ struct ether_multi {
 struct _ifnet {                /* and the entries */
     IOEthernetInterface *iface;
     IOEthernetController* controller;
+    // Installed and cleared under the shared command gate. Input consumes mbufs.
+    void (*native_input)(void *context, mbuf_t packet);
+    void (*native_output_ready)(void *context);
+    void *native_input_context;
     int if_link_state;
     void *if_softc;
 //    struct    refcnt if_refcnt;
@@ -274,6 +278,9 @@ static inline int
 if_attach(struct _ifnet *ifp)
 {
     ifp->if_link_state = -1;
+    ifp->native_input = NULL;
+    ifp->native_output_ready = NULL;
+    ifp->native_input_context = NULL;
     return 0;
 }
 

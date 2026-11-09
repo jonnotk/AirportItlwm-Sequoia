@@ -125,8 +125,11 @@ ieee80211_proto_detach(struct _ifnet *ifp)
     XYLog("%s\n", __FUNCTION__);
 	struct ieee80211com *ic = (struct ieee80211com *)ifp;
 
-	mq_purge(&ic->ic_mgtq);
-	mq_purge(&ic->ic_pwrsaveq);
+    ieee80211_clear_native_assoc_ie(ic);
+    ieee80211_clear_native_reassoc(ic);
+
+	mq_destroy(&ic->ic_mgtq);
+	mq_destroy(&ic->ic_pwrsaveq);
 }
 
 void
@@ -1327,6 +1330,9 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 			ic->ic_stats.is_rx_auth_fail++;
 			return;
 		}
+		if (ic->ic_native_controlled)
+            ieee80211_native_reassoc_context_authenticate(&ic->ic_native_reassoc,
+                ic->ic_native_join_generation, ic->ic_bss->ni_bssid);
 		ieee80211_new_state(ic, IEEE80211_S_ASSOC,
 		    wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK);
 		break;
@@ -1413,6 +1419,19 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 #endif
 
 	ostate = ic->ic_state;
+    if (nstate == IEEE80211_S_INIT || nstate == IEEE80211_S_SCAN ||
+        nstate == IEEE80211_S_AUTH)
+        ieee80211_clear_native_assoc_ie(ic);
+    if (nstate == IEEE80211_S_INIT || nstate == IEEE80211_S_SCAN)
+        ieee80211_clear_native_reassoc(ic);
+    else if (nstate == IEEE80211_S_AUTH && ic->ic_native_reassoc.valid) {
+        if (!ic->ic_native_controlled || !ic->ic_bss ||
+            !ieee80211_native_reassoc_context_matches(&ic->ic_native_reassoc,
+                ic->ic_native_join_generation, ic->ic_bss->ni_bssid))
+            ieee80211_clear_native_reassoc(ic);
+        else
+            ic->ic_native_reassoc.authenticated = 0;
+    }
 	if (ifp->if_flags & IFF_DEBUG)
 		XYLog("%s: %s -> %s\n", ifp->if_xname,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
@@ -1621,10 +1640,13 @@ justcleanup:
 				    ifp->if_xname, ieee80211_state_name[ostate],
 				    ieee80211_state_name[nstate]);
 			break;
-		case IEEE80211_S_AUTH:
-			IEEE80211_SEND_MGMT(ic, ni,
-			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
+		case IEEE80211_S_AUTH: {
+            int subtype = ieee80211_native_assoc_request_type(ic, ni);
+            if (subtype < 0)
+                return EINVAL;
+			IEEE80211_SEND_MGMT(ic, ni, subtype, 0);
 			break;
+        }
 		case IEEE80211_S_RUN:
 			ieee80211_stop_ampdu_tx(ic, ni, mgt);
 			ieee80211_ba_del(ni);
@@ -1711,6 +1733,101 @@ justcleanup:
 }
 
 void
+ieee80211_clear_native_reassoc(struct ieee80211com *ic)
+{
+    ieee80211_native_reassoc_context_clear(&ic->ic_native_reassoc);
+}
+
+/* Pure preflight before association configuration or node_join_bss replacement.
+ * Commit the tentative generation only after success, without an observer call
+ * or gate-yielding operation between this helper and the caller's commit. */
+int
+ieee80211_prepare_native_reassoc(struct ieee80211com *ic,
+    struct ieee80211_node *target, uint64_t expected_generation, uint64_t proposed_generation)
+{
+    if (!ic || !target || !ic->ic_native_controlled ||
+        ic->ic_opmode != IEEE80211_M_STA || ic->ic_state != IEEE80211_S_RUN ||
+        !ic->ic_bss || !(ic->ic_ac.ac_if.if_flags & IFF_RUNNING) ||
+        !expected_generation || expected_generation != ic->ic_native_join_generation ||
+        !proposed_generation || proposed_generation == expected_generation ||
+        target->ni_state == IEEE80211_STA_COLLECT || !target->ni_chan ||
+        target->ni_chan == IEEE80211_CHAN_ANYC)
+        return 0;
+    struct ieee80211_node *previous = ic->ic_bss;
+    if (previous->ni_esslen != target->ni_esslen || !previous->ni_esslen ||
+        previous->ni_esslen > IEEE80211_NWID_LEN || memcmp(previous->ni_essid, target->ni_essid, previous->ni_esslen))
+        return 0;
+    if (ic->ic_flags & IEEE80211_F_RSNON) {
+        if (!previous->ni_port_valid || !(target->ni_capinfo & IEEE80211_CAPINFO_PRIVACY) ||
+            !(target->ni_rsnprotos & previous->ni_rsnprotos) ||
+            !(target->ni_rsnakms & previous->ni_rsnakms) ||
+            !(target->ni_rsnciphers & previous->ni_rsncipher) ||
+            target->ni_rsngroupcipher != previous->ni_rsngroupcipher)
+            return 0;
+    } else if (target->ni_capinfo & IEEE80211_CAPINFO_PRIVACY)
+        return 0;
+    return ieee80211_native_reassoc_context_prepare(&ic->ic_native_reassoc,
+        proposed_generation, previous->ni_bssid, target->ni_bssid);
+}
+
+int
+ieee80211_native_assoc_request_type(struct ieee80211com *ic,
+    struct ieee80211_node *ni)
+{
+    if (!ic->ic_native_controlled || !ic->ic_native_reassoc.valid)
+        return IEEE80211_FC0_SUBTYPE_ASSOC_REQ;
+    if (!ni || ni != ic->ic_bss || !ic->ic_native_reassoc.authenticated ||
+        !ieee80211_native_reassoc_context_matches(&ic->ic_native_reassoc,
+            ic->ic_native_join_generation, ni->ni_bssid))
+        return -1;
+    return IEEE80211_FC0_SUBTYPE_REASSOC_REQ;
+}
+
+void
+ieee80211_clear_native_assoc_ie(struct ieee80211com *ic)
+{
+    ic->ic_native_assoc_ie_valid = false;
+    ic->ic_native_assoc_ie_len = 0;
+    ic->ic_native_assoc_ie_generation = 0;
+    memset(ic->ic_native_assoc_ie_bssid, 0, sizeof(ic->ic_native_assoc_ie_bssid));
+    memset(ic->ic_native_assoc_ie, 0, sizeof(ic->ic_native_assoc_ie));
+}
+
+void
+ieee80211_capture_native_assoc_ie(struct ieee80211com *ic,
+    struct ieee80211_node *ni, const u_int8_t *ie, size_t length)
+{
+    if (!ic->ic_native_controlled || !ni || ni != ic->ic_bss)
+        return;
+    ieee80211_clear_native_assoc_ie(ic);
+    if (!ic->ic_native_join_generation || length > sizeof(ic->ic_native_assoc_ie) ||
+        (length && (!ie || length < 2 || (size_t)ie[1] + 2 != length ||
+         (ie[0] != IEEE80211_ELEMID_RSN && ie[0] != IEEE80211_ELEMID_VENDOR))))
+        return;
+    if (length && ni->ni_rsnprotos != IEEE80211_PROTO_RSN &&
+        ni->ni_rsnprotos != IEEE80211_PROTO_WPA)
+        return;
+    if (length)
+        memcpy(ic->ic_native_assoc_ie, ie, length);
+    ic->ic_native_assoc_ie_len = (uint16_t)length;
+    ic->ic_native_assoc_ie_generation = ic->ic_native_join_generation;
+    IEEE80211_ADDR_COPY(ic->ic_native_assoc_ie_bssid, ni->ni_bssid);
+    ic->ic_native_assoc_ie_valid = true;
+}
+
+void
+ieee80211_authorize_port(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    /* The HAL can defer authorization until accepted key commands complete. */
+    if (ic->ic_key_ready && !(*ic->ic_key_ready)(ic, ni)) {
+        ni->ni_port_valid = 0;
+        return;
+    }
+    ni->ni_port_valid = 1;
+    ieee80211_set_link_state(ic, LINK_STATE_UP);
+}
+
+void
 ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
 {
 	struct _ifnet *ifp = &ic->ic_if;
@@ -1735,6 +1852,13 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
         if (link_state == LINK_STATE_UP) {
             XYLog("%s LINK_STATE_IS_UP\n", __FUNCTION__);
             ifp->controller->setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, ifp->controller->getCurrentMedium());
+            if (ic->ic_native_controlled && ic->ic_event_handler && ic->ic_bss) {
+                struct ieee80211_native_join_event event;
+                event.generation = ic->ic_native_join_generation;
+                event.status = 0;
+                IEEE80211_ADDR_COPY(event.bssid, ic->ic_bss->ni_bssid);
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_NATIVE_PORT_AUTHORIZED, &event);
+            }
         } else {
             XYLog("%s LINK_STATE_IS_DOWN\n", __FUNCTION__);
             ifp->controller->setLinkStatus(kIONetworkLinkValid);

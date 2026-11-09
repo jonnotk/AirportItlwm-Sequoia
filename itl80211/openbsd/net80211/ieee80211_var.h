@@ -46,6 +46,8 @@
 #ifndef _NET80211_IEEE80211_VAR_H_
 #define _NET80211_IEEE80211_VAR_H_
 
+#include <net80211/ieee80211_native_reassoc.h>
+
 /*
  * Definitions for IEEE 802.11 drivers.
  */
@@ -400,6 +402,42 @@ struct ieee80211_defrag {
 
 #define IEEE80211_GROUP_NKID	6
 
+// Borrowed event data. The observer must copy bytes before returning.
+struct ieee80211_native_beacon_event {
+    mbuf_t frame;
+    const struct ieee80211_rxinfo *rxinfo;
+    uint16_t channel;
+    uint32_t channel_flags;
+};
+struct ieee80211_native_join_event {
+    uint64_t generation;
+    uint16_t status;
+    uint8_t bssid[IEEE80211_ADDR_LEN];
+};
+// The HAL reports completed core transitions, separately from user power mode.
+struct ieee80211_native_core_event {
+    uint64_t generation;
+    uint32_t state;
+    int32_t status;
+};
+#define IEEE80211_NATIVE_CORE_OFF       0
+#define IEEE80211_NATIVE_CORE_READY     1
+#define IEEE80211_NATIVE_CORE_FAILED    2
+
+// Internal borrowed lifecycle carrier. This is not an Apple wire structure.
+struct ieee80211_native_reset_event {
+    uint64_t identity, origin_core_generation, generation;
+    uint64_t reload_generation, enable_attempt;
+    int32_t origin_hardware_generation, hardware_generation;
+    uint32_t state;
+    int32_t status;
+};
+#define IEEE80211_NATIVE_RESET_BEGIN       0
+#define IEEE80211_NATIVE_RESET_QUIESCED    1
+#define IEEE80211_NATIVE_RESET_RELOADING   2
+#define IEEE80211_NATIVE_RESET_COMPLETE    3
+#define IEEE80211_NATIVE_RESET_CANCELLED   4
+
 struct ieee80211com {
 	struct arpcom		ic_ac;
 	LIST_ENTRY(ieee80211com) ic_list;	/* chain of all ieee80211com */
@@ -423,6 +461,7 @@ struct ieee80211com {
 	int			(*ic_set_key)(struct ieee80211com *,
 				    struct ieee80211_node *,
 				    struct ieee80211_key *);
+    bool (*ic_key_ready)(struct ieee80211com *, struct ieee80211_node *);
 	void			(*ic_delete_key)(struct ieee80211com *,
 				    struct ieee80211_node *,
 				    struct ieee80211_key *);
@@ -439,6 +478,16 @@ struct ieee80211com {
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
+    bool            ic_native_controlled;
+    uint64_t        ic_native_join_generation;
+    struct ieee80211_native_reassoc_context ic_native_reassoc;
+    uint64_t        ic_native_core_generation;
+    bool            ic_native_fastlane_override;
+    bool            ic_native_assoc_ie_valid;
+    uint16_t        ic_native_assoc_ie_len;
+    uint64_t        ic_native_assoc_ie_generation;
+    uint8_t         ic_native_assoc_ie_bssid[IEEE80211_ADDR_LEN];
+    uint8_t         ic_native_assoc_ie[257];
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
@@ -514,6 +563,14 @@ struct ieee80211com {
 	struct ieee80211_edca_ac_params ic_edca_ac[EDCA_NUM_AC];
 	u_int			ic_edca_updtcount;
 	u_int16_t		ic_tid_noack;
+	/* Data MPDUs per EDCA AC for getWCL_TRAFFIC_COUNTERS. */
+	uint64_t		ic_wcl_tx_ac[EDCA_NUM_AC];
+	uint64_t		ic_wcl_rx_ac[EDCA_NUM_AC];
+	/* Last beacon of our BSS for getBEACON_INFO (Apple returns the
+	 * firmware's last beacon). Single writer (RX), seqlock reader. */
+	volatile uint32_t	ic_bcn_gen;
+	uint32_t		ic_bcn_len;
+	uint8_t			ic_bcn_frame[0x800];
 	u_int8_t		ic_globalcnt[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_nonce[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_psk[IEEE80211_PMK_LEN];
@@ -662,6 +719,12 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_STA_DEAUTH                2
 #define IEEE80211_EVT_COUNTRY_CODE_UPDATE       3
 #define IEEE80211_EVT_SCAN_DONE                 4
+#define IEEE80211_EVT_NATIVE_BEACON             5
+#define IEEE80211_EVT_NATIVE_JOIN_FAILURE       6
+#define IEEE80211_EVT_NATIVE_PORT_AUTHORIZED    7
+#define IEEE80211_EVT_STA_DISASSOC              8
+#define IEEE80211_EVT_NATIVE_CORE_STATE         9
+#define IEEE80211_EVT_NATIVE_RESET_STATE        10
 
 void	ieee80211_ifattach(struct _ifnet *, IOEthernetController *controller);
 void	ieee80211_ifdetach(struct _ifnet *);

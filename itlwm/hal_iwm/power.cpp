@@ -181,8 +181,11 @@ iwm_power_build_cmd(struct iwm_softc *sc, struct iwm_node *in,
     keep_alive = roundup(keep_alive, 1000) / 1000;
     cmd->keep_alive_seconds = htole16(keep_alive);
     
-    if (ic->ic_opmode != IEEE80211_M_MONITOR)
-        cmd->flags = htole16(IWM_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+    /*
+     * Keep Wi-Fi in continuous active mode for Bluetooth coexistence latency.
+     * This matches iwlmvm CAM behavior by leaving power-save flags clear.
+     */
+    cmd->flags = 0;
 }
 
 int ItlIwm::
@@ -213,8 +216,7 @@ iwm_power_update_device(struct iwm_softc *sc)
     struct iwm_device_power_cmd cmd = { };
     struct ieee80211com *ic = &sc->sc_ic;
     
-    if (ic->ic_opmode != IEEE80211_M_MONITOR)
-        cmd.flags = htole16(IWM_DEVICE_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+    cmd.flags = 0;
     
     return iwm_send_cmd_pdu(sc,
                             IWM_POWER_TABLE_CMD, 0, sizeof(cmd), &cmd);

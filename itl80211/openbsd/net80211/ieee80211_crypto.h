@@ -153,6 +153,10 @@ int	ieee80211_set_key(struct ieee80211com *, struct ieee80211_node *,
 	    struct ieee80211_key *);
 void	ieee80211_delete_key(struct ieee80211com *, struct ieee80211_node *,
 	    struct ieee80211_key *);
+void ieee80211_clear_native_bss_keys(struct ieee80211com *,
+    const struct ieee80211_node *);
+void ieee80211_reset_native_bss_security(struct ieee80211com *,
+    struct ieee80211_node *);
 
 void	ieee80211_eapol_key_mic(struct ieee80211_eapol_key *,
 	    const u_int8_t *);

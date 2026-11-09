@@ -95,6 +95,8 @@ void
 ieee80211_begin_bgscan(struct _ifnet *ifp)
 {
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
+    if (ic->ic_native_controlled)
+        return;
     
     if (ic->ic_state != IEEE80211_S_RUN || ic->ic_mgt_timer != 0)
         return;
@@ -132,6 +134,8 @@ ieee80211_begin_cache_bgscan(struct _ifnet *ifp)
 {
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
     struct timeval tv;
+    if (ic->ic_native_controlled)
+        return;
     
     if ((ic->ic_flags & IEEE80211_F_BGSCAN) ||
         ic->ic_state != IEEE80211_S_RUN || ic->ic_mgt_timer != 0)
@@ -221,6 +225,11 @@ ieee80211_ifattach(struct _ifnet *ifp, IOEthernetController *controller)
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
     
     ifp->controller = controller;
+    ic->ic_native_controlled = false;
+    ic->ic_native_join_generation = 0;
+    ieee80211_clear_native_reassoc(ic);
+    ic->ic_native_fastlane_override = false;
+    ieee80211_clear_native_assoc_ie(ic);
     ifq_init(&ifp->if_snd, ifp, 2048);
     memcpy(((struct arpcom *)ifp)->ac_enaddr, ic->ic_myaddr,
            ETHER_ADDR_LEN);

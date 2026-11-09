@@ -412,6 +412,8 @@ ieee80211_up_to_ac(struct ieee80211com *ic, int up)
 	 * admission control.
 	 */
 	while (ac != EDCA_AC_BK && ic->ic_edca_ac[ac].ac_acm) {
+        if (ac == EDCA_AC_VO && ic->ic_native_controlled && ic->ic_native_fastlane_override)
+            break;
 		switch (ac) {
 		case EDCA_AC_BK:
 			/* can't get there */
@@ -648,6 +650,8 @@ fallback:
         hdrlen = sizeof(struct ieee80211_frame);
         addqos = 0;
     }
+    /* Count by the AC this frame is classified to (tid 0 = BE otherwise). */
+    ic->ic_wcl_tx_ac[ieee80211_up_to_ac(ic, tid)]++;
     mbuf_adj(m, sizeof(struct ether_header) - LLC_SNAPFRAMELEN);
     llc = mtod(m, struct llc *);
     llc->llc_dsap = llc->llc_ssap = LLC_SNAP_LSAP;
@@ -1555,8 +1559,18 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	const struct ieee80211_rateset *rs = &ni->ni_rates;
 	mbuf_t m;
-	u_int8_t *frm;
+	u_int8_t *frm, *native_ie;
 	u_int16_t capinfo;
+    u_int8_t previous_bssid[IEEE80211_ADDR_LEN];
+
+    if (type == IEEE80211_FC0_SUBTYPE_REASSOC_REQ && ic->ic_native_controlled &&
+        (ni != ic->ic_bss || !ieee80211_native_reassoc_context_current_ap(
+            &ic->ic_native_reassoc, ic->ic_native_join_generation, ni->ni_bssid,
+            previous_bssid)))
+        return NULL;
+
+    if (ic->ic_native_controlled && ni == ic->ic_bss)
+        ieee80211_clear_native_assoc_ie(ic);
 
 	m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA,
 	    2 + 2 +
@@ -1591,7 +1605,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	LE_WRITE_2(frm, capinfo); frm += 2;
 	LE_WRITE_2(frm, ic->ic_lintval); frm += 2;
 	if (type == IEEE80211_FC0_SUBTYPE_REASSOC_REQ) {
-		IEEE80211_ADDR_COPY(frm, ic->ic_bss->ni_bssid);
+		IEEE80211_ADDR_COPY(frm, ic->ic_native_controlled ? previous_bssid : ic->ic_bss->ni_bssid);
 		frm += IEEE80211_ADDR_LEN;
 	}
 	frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
@@ -1600,6 +1614,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		frm = ieee80211_add_xrates(frm, rs);
 	if ((ic->ic_flags & IEEE80211_F_RSNON) &&
 		(ni->ni_rsnprotos & IEEE80211_PROTO_RSN)) {
+		native_ie = frm;
 #ifdef USE_APPLE_SUPPLICANT
 		if (ic->ic_rsn_ie_override[1] > 0) {
 			memcpy(frm, ic->ic_rsn_ie_override, 2 + ic->ic_rsn_ie_override[1]);
@@ -1608,11 +1623,13 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		else
 #endif
 		frm = ieee80211_add_rsn(frm, ic, ni);
+		ieee80211_capture_native_assoc_ie(ic, ni, native_ie, frm - native_ie);
 	}
 	if (ni->ni_flags & IEEE80211_NODE_QOS)
 		frm = ieee80211_add_qos_capability(frm, ic);
 	if ((ic->ic_flags & IEEE80211_F_RSNON) &&
 		(ni->ni_rsnprotos & IEEE80211_PROTO_WPA)) {
+		native_ie = frm;
 #ifdef USE_APPLE_SUPPLICANT
 		if (ic->ic_rsn_ie_override[1] > 0) {
 			memcpy(frm, ic->ic_rsn_ie_override, 2 + ic->ic_rsn_ie_override[1]);
@@ -1621,6 +1638,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		else
 #endif
 		frm = ieee80211_add_wpa(frm, ic, ni);
+		ieee80211_capture_native_assoc_ie(ic, ni, native_ie, frm - native_ie);
 	}
 	if (ic->ic_flags & IEEE80211_F_HTON) {
 		frm = ieee80211_add_htcaps(frm, ic);
@@ -1632,6 +1650,9 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     
     if (ic->ic_flags & IEEE80211_F_HEON)
         frm = ieee80211_add_hecaps(frm, ic);
+
+    if (!(ic->ic_flags & IEEE80211_F_RSNON))
+        ieee80211_capture_native_assoc_ie(ic, ni, NULL, 0);
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);
@@ -1935,6 +1956,35 @@ ieee80211_get_sa_query(struct ieee80211com *ic, struct ieee80211_node *ni,
 	return m;
 }
 
+/*
+ * SM Power Save action frame (802.11-2020 9.6.11.2):
+ * [1] Category HT
+ * [1] Action SM Power Save
+ * [1] SM Power Control: bit 0 enabled, bit 1 mode (0 static, 1 dynamic)
+ */
+static mbuf_t
+ieee80211_get_sm_pwrsave(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int8_t control)
+{
+	mbuf_t m;
+	u_int8_t *frm;
+
+	m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA, 3);
+	if (m == NULL)
+		return NULL;
+
+	frm = mtod(m, u_int8_t *);
+	*frm++ = IEEE80211_CATEG_HT;
+	*frm++ = IEEE80211_ACTION_SM_PWRSAVE;
+	*frm++ = control & 0x3;
+
+    size_t l = frm - mtod(m, u_int8_t *);
+    mbuf_pkthdr_setlen(m, l);
+    mbuf_setlen(m, l);
+
+	return m;
+}
+
 mbuf_t
 ieee80211_get_action(struct ieee80211com *ic, struct ieee80211_node *ni,
     u_int8_t categ, u_int8_t action, int arg)
@@ -1956,6 +2006,10 @@ ieee80211_get_action(struct ieee80211com *ic, struct ieee80211_node *ni,
 			    arg >> 16);
 			break;
 		}
+		break;
+	case IEEE80211_CATEG_HT:
+		if (action == IEEE80211_ACTION_SM_PWRSAVE)
+			m = ieee80211_get_sm_pwrsave(ic, ni, arg & 0xff);
 		break;
 	case IEEE80211_CATEG_SA_QUERY:
 		switch (action) {

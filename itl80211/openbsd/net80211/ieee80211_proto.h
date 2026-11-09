@@ -76,6 +76,13 @@ extern	void ieee80211_proto_detach(struct _ifnet *);
 struct ieee80211_node;
 struct ieee80211_rxinfo;
 struct ieee80211_rsnparams;
+extern void ieee80211_authorize_port(struct ieee80211com *, struct ieee80211_node *);
+extern void ieee80211_clear_native_assoc_ie(struct ieee80211com *);
+extern void ieee80211_clear_native_reassoc(struct ieee80211com *);
+extern int ieee80211_prepare_native_reassoc(struct ieee80211com *, struct ieee80211_node *, uint64_t, uint64_t);
+extern int ieee80211_native_assoc_request_type(struct ieee80211com *, struct ieee80211_node *);
+extern void ieee80211_capture_native_assoc_ie(struct ieee80211com *,
+    struct ieee80211_node *, const u_int8_t *, size_t);
 extern	void ieee80211_set_link_state(struct ieee80211com *, int);
 extern	u_int ieee80211_get_hdrlen(const struct ieee80211_frame *);
 extern	int ieee80211_classify(struct ieee80211com *, mbuf_t);

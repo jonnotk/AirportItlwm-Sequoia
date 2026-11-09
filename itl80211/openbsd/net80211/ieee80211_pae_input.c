@@ -688,8 +688,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             if (deferlink == 0) {
                 DPRINTF(("marking port %s valid\n",
                          ether_sprintf(ni->ni_macaddr)));
-                ni->ni_port_valid = 1;
-                ieee80211_set_link_state(ic, LINK_STATE_UP);
+                ieee80211_authorize_port(ic, ni);
             }
             ni->ni_assoc_fail = 0;
             if (ic->ic_opmode == IEEE80211_M_STA)
@@ -972,8 +971,7 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         {
             DPRINTF(("marking port %s valid\n",
                      ether_sprintf(ni->ni_macaddr)));
-            ni->ni_port_valid = 1;
-            ieee80211_set_link_state(ic, LINK_STATE_UP);
+            ieee80211_authorize_port(ic, ni);
             ni->ni_assoc_fail = 0;
         }
     }
@@ -1082,8 +1080,7 @@ ieee80211_recv_wpa_group_msg1(struct ieee80211com *ic,
         {
             DPRINTF(("marking port %s valid\n",
                      ether_sprintf(ni->ni_macaddr)));
-            ni->ni_port_valid = 1;
-            ieee80211_set_link_state(ic, LINK_STATE_UP);
+            ieee80211_authorize_port(ic, ni);
             ni->ni_assoc_fail = 0;
         }
     }

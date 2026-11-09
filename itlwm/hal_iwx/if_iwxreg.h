@@ -1401,6 +1401,7 @@ enum iwx_msix_ivar_for_cause {
 #define IWX_UCODE_TLV_CAPA_EXTENDED_DTS_MEASURE        64
 #define IWX_UCODE_TLV_CAPA_SHORT_PM_TIMEOUTS        65
 #define IWX_UCODE_TLV_CAPA_BT_MPLUT_SUPPORT        67
+#define IWX_UCODE_TLV_CAPA_COEX_SCHEMA_2            45 /* Linux IWL_UCODE_TLV_CAPA_COEX_SCHEMA_2 */
 #define IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT    68
 #define IWX_UCODE_TLV_CAPA_BEACON_ANT_SELECTION        71
 #define IWX_UCODE_TLV_CAPA_BEACON_STORING        72
@@ -2181,7 +2182,7 @@ struct iwx_temp_report_ths_cmd {
  * @IWX_NVM_CHANNEL_INDOOR_ONLY: only indoor use is allowed
  * @IWX_NVM_CHANNEL_GO_CONCURRENT: GO operation is allowed when connected to BSS
  *    on same channel on 2.4 or same UNII band on 5.2
- * @IWX_NVM_CHANNEL_DFS: dynamic freq selection candidate
+ * @IWX_NVM_CHANNEL_UNIFORM: uniform spreading required
  * @IWX_NVM_CHANNEL_WIDE: 20 MHz channel okay (?)
  * @IWX_NVM_CHANNEL_40MHZ: 40 MHz channel okay (?)
  * @IWX_NVM_CHANNEL_80MHZ: 80 MHz channel okay (?)
@@ -2194,7 +2195,7 @@ struct iwx_temp_report_ths_cmd {
 #define IWX_NVM_CHANNEL_RADAR    (1 << 4)
 #define IWX_NVM_CHANNEL_INDOOR_ONLY    (1 << 5)
 #define IWX_NVM_CHANNEL_GO_CONCURRENT    (1 << 6)
-#define IWX_NVM_CHANNEL_DFS    (1 << 7)
+#define IWX_NVM_CHANNEL_UNIFORM    (1 << 7)
 #define IWX_NVM_CHANNEL_WIDE    (1 << 8)
 #define IWX_NVM_CHANNEL_40MHZ    (1 << 9)
 #define IWX_NVM_CHANNEL_80MHZ    (1 << 10)
@@ -7806,6 +7807,43 @@ struct iwx_bt_coex_cmd {
     uint32_t mode;
     uint32_t enabled_modules;
 } __packed; /* BT_COEX_CMD_API_S_VER_6 */
+
+/*
+ * BT coex channel inhibition, sent with IWX_BT_COEX_CI. Linux iwlwifi
+ * (mvm/coex.c, iwl_mvm_bt_coex_notif_handle) sends it on association and
+ * channel changes for device families before AX210.
+ */
+struct iwx_bt_coex_ci_cmd {
+    uint64_t bt_primary_ci;
+    uint32_t primary_ch_phy_id;
+    uint64_t bt_secondary_ci;
+    uint32_t secondary_ch_phy_id;
+} __packed; /* BT_CI_MSG_API_S_VER_2 */
+
+#define IWX_BT_OFF                0
+#define IWX_BT_ON_NO_CONNECTION   1
+#define IWX_BT_LOW_TRAFFIC        2
+#define IWX_BT_HIGH_TRAFFIC       3
+#define IWX_BT_VERY_HIGH_TRAFFIC  4
+
+/* Our own SM power save mode, chosen from the BT activity grade on 2.4 GHz. */
+#define IWX_BT_SMPS_OFF           0
+#define IWX_BT_SMPS_DYNAMIC       1
+#define IWX_BT_SMPS_STATIC        2
+
+/* IWX_BT_PROFILE_NOTIFICATION payload (Linux iwl_bt_coex_prof_old_notif). */
+struct iwx_bt_coex_prof_old_notif {
+    uint32_t mbox_msg[4];
+    uint32_t msg_idx;
+    uint32_t bt_ci_compliance;
+    uint32_t primary_ch_lut;
+    uint32_t secondary_ch_lut;
+    uint32_t bt_activity_grading;
+    uint8_t ttc_status;
+    uint8_t rrc_status;
+    uint8_t wifi_loss_low_rssi;
+    uint8_t wifi_loss_mid_high_rssi;
+} __packed; /* BT_COEX_PROFILE_NTFY_API_S_VER_4/5 */
 
 
 /*

@@ -26,16 +26,27 @@
 OSDefineMetaClassAndStructors(pci_intr_handle, OSObject)
 
 int pci_get_capability(pci_chipset_tag_t chipsettag, pcitag_t pcitag, int capid, int *offsetp, pcireg_t *valuep) {
-	uint8_t offset;
-	UInt32 value = pcitag->findPCICapability(capid, &offset);
-	if (valuep)
-		*valuep = (pcireg_t)value;
-	if (offsetp)
-		*offsetp = offset;
-	if (value == 0)
+	// 2026-06-21 FIX: AirportItlwm's HAL triple-faults calling IOPCIDevice::findPCICapability() through the
+	// IOPCIEDeviceWrapper provider hierarchy (localized: iwx_attach breadcrumb stops at CP=410, 4101 never
+	// prints). Raw config reads ARE known-good on this device (setBusMasterEnable/configWrite8 succeed
+	// immediately before, AirportItlwmV2.cpp:439-442). So walk the PCI capability list by hand via
+	// configRead32 instead. Equivalent result for standalone itlwm (direct IOPCIDevice provider).
+	if (offsetp) *offsetp = 0;
+	if (valuep)  *valuep  = 0;
+	uint32_t cmdsts = pcitag->configRead32(0x04);              // command (15:0) | status (31:16)
+	if (!((cmdsts >> 16) & 0x10))                              // status bit 4 = capability list present
 		return 0;
-	else
-		return 1;
+	uint8_t ptr = (uint8_t)(pcitag->configRead32(0x34) & 0xFC); // capabilities pointer (byte @ 0x34)
+	for (int guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+		uint32_t cap = pcitag->configRead32(ptr);
+		if ((cap & 0xFF) == (uint32_t)(capid & 0xFF)) {        // byte0 = capability ID
+			if (offsetp) *offsetp = ptr;
+			if (valuep)  *valuep  = cap;
+			return 1;
+		}
+		ptr = (uint8_t)((cap >> 8) & 0xFC);                    // byte1 = next-capability pointer
+	}
+	return 0;
 }
 
 pcireg_t pci_conf_read(pci_chipset_tag_t pc, pcitag_t tag, int reg) {

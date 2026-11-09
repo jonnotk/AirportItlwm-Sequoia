@@ -150,6 +150,7 @@ public:
     void free() override;
     virtual bool attach(IOPCIDevice *device) override;
     virtual void detach(IOPCIDevice *device) override;
+    virtual bool quiesceForDetach() override;
     IOReturn enable(IONetworkInterface *netif) override;
     IOReturn disable(IONetworkInterface *netif) override;
     virtual struct ieee80211com *get80211Controller() override;
@@ -169,6 +170,7 @@ public:
     virtual bool is5GBandSupport() override;
     
     virtual int getTxNSS() override;
+    virtual int getBtCoexMaxNSS() override;
     
     virtual const char *getFirmwareName() override;
     
@@ -177,9 +179,160 @@ public:
     virtual const char *getFirmwareCountryCode() override;
 
     virtual uint32_t getTxQueueSize() override;
+    bool copyPermanentHardwareAddress(uint8_t *address) const override {
+        if (!address) return false;
+        memcpy(address, com.sc_nvm.hw_addr, sizeof(com.sc_nvm.hw_addr));
+        return true;
+    }
     
     //driver controller
     virtual void clearScanningFlags() override;
+    bool supportsNativeScan() const override {
+        return pci.pa_tag != NULL && com.sc_capa_n_scan_channels > 0;
+    }
+    IOReturn startNativeScan(const ItlNativeScanProfile &,
+                            ItlNativeScanCompletion, void *) override;
+    IOReturn cancelNativeScan(uint64_t) override;
+    IOReturn nativeSoftLeave(uint64_t) override;
+    IOReturn nativeSetHardwareAddress(const uint8_t *) override;
+    IOReturn nativeWaitUntilReady(uint64_t, const uint64_t *, uint64_t) override;
+    bool nativeScanInitializationReady() const override;
+    bool nativeRadioStopPending() const override { return nativeStopInProgress; }
+    // Source-owned entry and admission helpers. No Apple virtual slot is added.
+    IOReturn nativeExternalControlStatus(IOCommandGate *, IOWorkLoop *);
+    IOReturn nativeRadioInputStatus(IOCommandGate *, IOWorkLoop *);
+    IOReturn inspectNativeActivation(IOCommandGate *, IOWorkLoop *, bool *);
+    bool nativeActivationDrained();
+    bool nativeRegulatoryReady() const override {
+        return !nativeMccBusy && !nativeMccPending && !nativeMccRefreshing &&
+            !nativeMccFailed && !nativeMccScanDeferred;
+    }
+    bool nativeKeyInstallPending() const override;
+    bool nativeDataOutputReady() const override;
+    bool nativeReassociationReady() override;
+    bool copyNativeCurrentRates(ItlNativeCurrentRates *) override;
+
+private:
+    ItlNativeCurrentRates nativeCurrentRates;
+    bool nativeCurrentRatesValid;
+    int nativeCurrentRatesHardwareGeneration;
+    uint64_t nativeCurrentRatesJoinGeneration;
+    uint8_t nativeCurrentRatesBssid[6];
+    uint16_t nativeCurrentRatesFrequency;
+    uint8_t nativeCurrentRatesWidth;
+    void clearNativeCurrentRates();
+    void captureNativeCurrentRates(struct iwx_softc *, struct ieee80211_node *,
+        const struct iwx_tlc_config_cmd_v4 &);
+    bool nativeQuiescing;
+    bool nativeStopInProgress;
+    thread_t nativeStopOwner = NULL;
+    uint64_t nativeEnableAttempt;
+    bool nativeEnablePending;
+    IOReturn nativeEnableResult;
+    void completeNativeEnable(uint64_t, IOReturn);
+    void completeNativeAdmissionError(uint64_t, IOReturn);
+    uint64_t nativeRecoverySequence;
+    struct ieee80211_native_reset_event nativeRecovery;
+    thread_t nativeRecoveryStopOwner;
+    bool nativeRecoveryActive, nativeRecoveryInitFinished, nativeRecoveryNeedsQuiescence;
+    uint64_t beginNativeRecovery();
+    void publishNativeRecovery(uint32_t, IOReturn);
+    void cancelNativeRecovery(IOReturn);
+    void tryCompleteNativeRecovery();
+    struct NativeKeyInstall {
+        bool active, expired;
+        uint8_t commandIndex, keyId;
+        bool group;
+        int hardwareGeneration;
+        uint64_t joinGeneration, deadline;
+        uint8_t bssid[6];
+    } nativeKeyInstalls[8];
+    int nativeKeyHardwareGeneration;
+    uint64_t nativeKeyJoinGeneration;
+    uint8_t nativeKeyBssid[6];
+    bool nativeKeyFailed, nativeKeyPortRequested;
+    static bool iwx_key_ready(struct ieee80211com *, struct ieee80211_node *);
+    bool nativeKeyContextMatches(struct ieee80211_node *) const;
+    bool nativeKeyIndexBusy(unsigned) const;
+    int submitNativeKey(struct ieee80211_node *, struct ieee80211_key *,
+        const struct iwx_add_sta_key_cmd *);
+    void nativeKeyResponse(struct iwx_rx_packet *, int, int);
+    void failNativeKeys(struct ieee80211_node *, int);
+    void expireNativeKeys();
+    void resetNativeKeys();
+
+    struct NativeWaiter { thread_t thread; void *event; } nativeWaiters[8];
+    struct NativeTaskCall { ItlIwx *hal; void (*function)(void *); void *argument; };
+    static IOReturn nativeTaskGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn nativeStopGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn nativeDetachGated(OSObject *, void *, void *, void *, void *);
+    static void nativeTaskDispatch(void *, void (*)(void *));
+    static void nativeInitTask(void *);
+    static void nativeNewstateTask(void *);
+    static void nativeBATask(void *);
+    static void nativeMacTask(void *);
+    static void nativeChanTask(void *);
+    void nativeTaskAdmission(bool);
+    void nativeDrainTasks();
+    int tsleep_nsec(void *, int, const char *, int);
+    void wakeupOn(void *);
+    ItlNativeScanProfile nativeScanProfile;
+    ItlNativeScanCompletion nativeScanCompletion;
+    struct task nativeMccRefreshTask;
+    static void nativeMccTaskEntry(void *);
+    static void iwx_mcc_task(void *);
+    bool nativeMccPending, nativeMccRefreshing, nativeMccFailed;
+    bool nativeMccHeSuspended;
+    int nativeMccBusy;
+    uint64_t nativeMccSequence;
+    char nativeMccRequested[3];
+    uint8_t nativeMccSource;
+    bool nativeMccScanDeferred;
+    IOReturn nativeMccScanStatus;
+    uint8_t nativeMccScanFirmwareStatus;
+    void publishNativeCoreState(struct iwx_softc *, uint32_t, int);
+    bool preinitComplete;
+    int pnvmComplete;
+    uint32_t pnvmStatus;
+    int iwx_wait_fw_state(struct iwx_softc *, void *, const volatile int *,
+        int, int, uint64_t);
+    void *nativeScanContext;
+    uint64_t nativeScanToken;
+    uint32_t nativeScanUID;
+    int firmwareScanFinalPending;
+    bool nativeScanPending;
+    bool nativeScanCancelled;
+    bool nativeScanSubmitting;
+    void finishNativeScan(IOReturn, uint8_t);
+    bool hasNativeScanProfile() const { return nativeScanPending && !nativeScanCancelled; }
+    void fillNativeScanSSIDs(struct iwx_ssid_ie *);
+    uint8_t nativeScanSSIDCount() const {
+        return nativeScanProfile.passive ? 0 :
+            (nativeScanProfile.ssidCount ? nativeScanProfile.ssidCount : 1);
+    }
+#if __IO80211_TARGET >= __MAC_15_0 && !defined(AIRITL_ENABLE_BSDIF)
+    enum class RxStopObservation { NotReached, AccessNotGranted, IdleObserved, IdleNotObserved };
+    enum class MasterStopObservation { NotReached, DisabledObserved, DisabledNotObserved };
+    enum class StopPurpose { OrdinaryRadioRecovery, SystemOffNoRearm };
+    enum class StopStepDisposition { NotRun, Returned, SkippedByPurpose };
+    struct StopDeviceRecipeReport {
+        bool validPurpose;
+        RxStopObservation rxObservation;
+        MasterStopObservation masterObservation;
+        bool finalResetRequestAndSettleReached;
+        bool routingConfigured;
+        bool finalDeviceMaskIssued;
+        StopStepDisposition rfkillDisposition;
+        StopStepDisposition prepareDisposition;
+        int prepareCode;
+        bool firmwareResourcesSuffixReached;
+        bool sequenceReached;
+    };
+    RxStopObservation iwx_disable_rx_dma_observed(struct iwx_softc *);
+    MasterStopObservation iwx_apm_stop_observed(struct iwx_softc *);
+    StopDeviceRecipeReport iwx_stop_device_recipe(struct iwx_softc *, StopPurpose);
+#endif
+public:
     
     virtual IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
     
@@ -440,8 +593,12 @@ public:
             struct ieee80211_node *);
     int    iwx_sf_config(struct iwx_softc *, int);
     int    iwx_send_bt_init_conf(struct iwx_softc *);
+    int    iwx_bt_coex_update_ci(struct iwx_softc *, struct iwx_node *);
+    void   iwx_bt_coex_notif(struct iwx_softc *, struct iwx_rx_packet *);
+    void    iwx_bt_coex_eval_smps(struct iwx_softc *);
     int    iwx_send_soc_conf(struct iwx_softc *);
-    int    iwx_send_update_mcc_cmd(struct iwx_softc *, const char *);
+    int    iwx_send_update_mcc_cmd(struct iwx_softc *, const char *,
+        int = -1, uint64_t = 0);
     int    iwx_send_temp_report_ths_cmd(struct iwx_softc *);
     int    iwx_init_hw(struct iwx_softc *);
     int    iwx_init(struct _ifnet *);
@@ -480,8 +637,8 @@ public:
     
 public:
     IOInterruptEventSource* fInterrupt;
-    struct pci_attach_args pci;
-    struct iwx_softc com;
+    struct pci_attach_args pci = {};
+    struct iwx_softc com = {};
 };
 
 #endif

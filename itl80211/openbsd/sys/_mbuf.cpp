@@ -38,7 +38,13 @@ static IOReturn _if_input(OSObject *target, void *arg0, void *arg1, void *arg2, 
     struct _ifnet *ifq = (struct _ifnet *)arg0;
     struct mbuf_list *ml = (struct mbuf_list *)arg1;
     
-    MBUF_LIST_FOREACH(ml, m) {
+    // Unlink before either consumer can free the mbuf. Walking nextpkt after
+    // the native callback returns would read a freed packet.
+    while ((m = ml_dequeue(ml)) != NULL) {
+        if (ifq->native_input) {
+            ifq->native_input(ifq->native_input_context, m);
+            continue;
+        }
         if (ifq->iface == NULL) {
             panic("%s ifq->iface == NULL!!!\n", __FUNCTION__);
             break;
