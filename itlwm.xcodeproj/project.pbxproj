@@ -3902,7 +3902,7 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					AIRPORT,
-					"__IO80211_TARGET=__MAC_14_4",
+					"__IO80211_TARGET=__MAC_15_0",
 					__PRIVATE_SPI__,
 					IO80211FAMILY_V2,
 				);
@@ -3932,7 +3932,7 @@
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = itlwm/PrivateSPI.pch;
 				GCC_PREPROCESSOR_DEFINITIONS = (
-					"__IO80211_TARGET=__MAC_14_4",
+					"__IO80211_TARGET=__MAC_15_0",
 					AIRPORT,
 					__PRIVATE_SPI__,
 					"$(inherited)",

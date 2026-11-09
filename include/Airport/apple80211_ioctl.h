@@ -430,7 +430,13 @@ struct apple80211_bssid_data
     struct ether_addr    bssid;
 };
 
-#if __IO80211_TARGET >= __MAC_14_0
+#if __IO80211_TARGET >= __MAC_15_0
+struct apple80211_capability_data
+{
+    u_int32_t    version;
+    u_int8_t     capabilities[19];
+};
+#elif __IO80211_TARGET >= __MAC_14_0
 struct apple80211_capability_data
 {
     u_int32_t    version;
@@ -548,7 +554,13 @@ struct apple80211_authtype_data
     u_int32_t    version;
     u_int32_t    authtype_lower;    //    apple80211_authtype_lower
     u_int32_t    authtype_upper;    //    apple80211_authtype_upper
+#if __IO80211_TARGET >= __MAC_15_0
+    u_int32_t    authtype_selector;
+#endif
 };
+#if __IO80211_TARGET >= __MAC_15_0
+static_assert(sizeof(apple80211_authtype_data) == 16, "Native authentication carrier size");
+#endif
 
 struct apple80211_sup_channel_data
 {

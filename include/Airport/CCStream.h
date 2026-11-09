@@ -29,7 +29,11 @@ public:
     virtual void detach( IOService * provider ) APPLE_KEXT_OVERRIDE;
     virtual bool profileLoaded(void);
     virtual bool profileRemoved(void);
+#if __IO80211_TARGET >= __MAC_15_0
+    virtual bool initWithPipeAndName(CCPipe *,char const*,CCStreamOptions const*);
+#else
     virtual CCStream const *initWithPipeAndName(CCPipe *,char const*,CCStreamOptions const*);
+#endif
     
 public:
     static CCStream *withPipeAndName(CCPipe *,char const*,CCStreamOptions const*);

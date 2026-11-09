@@ -31,7 +31,12 @@ public:
     virtual void detach( IOService * provider ) APPLE_KEXT_OVERRIDE;
     virtual bool profileLoaded(void) APPLE_KEXT_OVERRIDE;
     virtual bool profileRemoved(void) APPLE_KEXT_OVERRIDE;
+    static CCLogStream *withPipeAndName(CCPipe *,char const*,CCStreamOptions const*);
+#if __IO80211_TARGET >= __MAC_15_0
+    virtual bool initWithPipeAndName(CCPipe *,char const*,CCStreamOptions const*) APPLE_KEXT_OVERRIDE;
+#else
     virtual CCLogStream const *initWithPipeAndName(CCPipe *,char const*,CCStreamOptions const*) APPLE_KEXT_OVERRIDE;
+#endif
     virtual void setLevel(CCStreamLogLevel);
     virtual CCStreamLogLevel getLevel(void);
     virtual void setFlags(unsigned long long);

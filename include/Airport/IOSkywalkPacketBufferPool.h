@@ -33,23 +33,33 @@ public:
     };
     
 public:
+#if __IO80211_TARGET >= __MAC_15_0
+    // Pinned 24G720 allocation methods return zero-success 32-bit status.
+    using AllocationResult = IOReturn;
+#else
+    using AllocationResult = bool;
+#endif
     virtual void free() APPLE_KEXT_OVERRIDE;
     virtual bool initWithName(char const*,void *,uint,IOSkywalkPacketBufferPool::PoolOptions const*);
     virtual bool initWithName(char const*,OSObject *,uint,IOSkywalkPacketBufferPool::PoolOptions const*);
-    virtual bool allocatePacket(IOSkywalkPacket **,uint);
-    virtual bool allocatePacket(uint,IOSkywalkPacket **,uint);
-    virtual bool allocatePackets(uint,uint *,IOSkywalkPacket **,uint);
+    virtual AllocationResult allocatePacket(IOSkywalkPacket **,uint);
+    virtual AllocationResult allocatePacket(uint,IOSkywalkPacket **,uint);
+    virtual AllocationResult allocatePackets(uint,uint *,IOSkywalkPacket **,uint);
     virtual void deallocatePacket(IOSkywalkPacket *);
     virtual void deallocatePackets(IOSkywalkPacket **,uint);
     virtual void deallocatePacketList(IOSkywalkPacket *);
     virtual void deallocatePacketChain(unsigned long long);
-    virtual bool allocatePacketBuffer(IOSkywalkPacketBuffer **,uint);
-    virtual bool allocatePacketBuffers(uint *,IOSkywalkPacketBuffer **,uint);
+    virtual AllocationResult allocatePacketBuffer(IOSkywalkPacketBuffer **,uint);
+    virtual AllocationResult allocatePacketBuffers(uint *,IOSkywalkPacketBuffer **,uint);
     virtual void deallocatePacketBuffer(IOSkywalkPacketBuffer *);
     virtual void deallocatePacketBuffers(IOSkywalkPacketBuffer **,uint);
-    virtual bool newPacket(IOSkywalkPacketDescriptor *,IOSkywalkPacket **);
-    virtual bool newPacketBuffer(IOSkywalkPacketBufferDescriptor *,IOSkywalkPacketBuffer **);
-    virtual bool newMemorySegment(IOSkywalkMemorySegmentDescriptor *,IOSkywalkMemorySegment **);
+    virtual AllocationResult newPacket(IOSkywalkPacketDescriptor *,IOSkywalkPacket **);
+    virtual AllocationResult newPacketBuffer(IOSkywalkPacketBufferDescriptor *,IOSkywalkPacketBuffer **);
+    // NOTE: Apple's real ABI returns IOReturn (0 = success, e.g. 0xe00002bd on failure), NOT bool.
+    // This was reconstructed wrong as `bool` originally; it only mattered once we OVERRIDE this slot
+    // (vtable slot 52 / runtime 0x190) in AirportItlwmSkywalkPacketPool — a bool return leaves the upper
+    // eax bits undefined and the framework's `test eax,eax` would misread success as failure.
+    virtual IOReturn newMemorySegment(IOSkywalkMemorySegmentDescriptor *,IOSkywalkMemorySegment **);
     
 public:
     static IOSkywalkPacketBufferPool *withName(char const*,OSObject *,uint,IOSkywalkPacketBufferPool::PoolOptions const*);

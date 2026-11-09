@@ -38,11 +38,27 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
         interface->setProperty("IOInterfaceName", OSString::withCString(infName));
         interface->setProperty(kIOInterfaceUnit, OSNumber::withNumber(ifnet_unit(getIfnet()), 8));
         interface->setProperty(kIOInterfaceNamePrefix, OSString::withCString(ifnet_name(getIfnet())));
-        if (OSDynamicCast(IOEthernetController, getController())->getHardwareAddress(&addr) == kIOReturnSuccess)
+        // BUG: getController() is an IO80211Controller,
+        // NOT an IOEthernetController, so OSDynamicCast(IOEthernetController, ...) returns NULL and the
+        // immediate ->getHardwareAddress() dereferences NULL -> wild dispatch -> triple-fault during the
+        // BSD/IONetworkStack attach at the verbose->GUI handoff. AirportItlwm DOES override getHardwareAddress
+        // (an IOEthernetController-signature method it inherits via IO80211Controller's chain), so call it
+        // directly with a null guard instead of the bogus cast.
+        // getHardwareAddress(IOEthernetAddress*) is a virtual on IO80211Controller (AirportItlwm's base),
+        // so reach it via an IO80211Controller* cast (no circular AirportItlwm include needed).
+        IO80211Controller *ctrl = OSDynamicCast(IO80211Controller, getController());
+        if (ctrl && ctrl->getHardwareAddress(&addr) == kIOReturnSuccess)
             setProperty(kIOMACAddress,  (void *) &addr,
                         kIOEthernetAddressSize);
-        interface->registerService();
-        interface->prepareBSDInterface(getIfnet(), 0);
+        // REMOVED (de-bridge): interface->registerService(); — fNetIf is already registered at CP9
+        // (attachInterface). Re-registering from the ethernet attach is a redundant Skywalk-bridge call.
+        // REMOVED (RE-confirmed CP10 crash): interface->prepareBSDInterface(getIfnet(), 0);
+        // `interface` is the Skywalk fNetIf; this called Apple's IOSkywalkNetworkInterface::prepareBSDInterface
+        // which dereferences mExpansionData->fRegistrationInfo+0x4c (the MTU). But fRegistrationInfo is only
+        // populated at CP11-13, AFTER this attach (CP10) runs -> NULL+0x4c wild dispatch -> triple-fault. It is
+        // also the WRONG call: prepareBSDInterface belongs to the Skywalk interface's OWN (deferred) BSD attach,
+        // not the legacy IOEthernetInterface. This bsdInterface carries data via the normal IOEthernet mbuf path
+        // (inputPacket/enqueueOutputPacket) and does not need to push its ifnet into the Skywalk interface.
 //        ret = bpf_attach(getIfnet(), DLT_RAW, 0x48, &AirportItlwmEthernetInterface::bpfOutputPacket, &AirportItlwmEthernetInterface::bpfTap);
     }
     isAttach = true;
@@ -57,12 +73,17 @@ detachFromDataLinkLayer(IOOptionBits options, void *parameter)
 }
 
 /**
- Add another hack to fake that the provider is IOSkywalkNetworkInterface, to avoid skywalkfamily instance cast panic.
+ De-bridged: was `return isAttach ? this->interface : super::getProvider();` — a hack that, AFTER attach,
+ reported the Skywalk interface as this IOEthernetInterface's provider "to avoid a skywalkfamily instance
+ cast panic". But it only fired post-attach — exactly when IONetworkStack/configd enumerate the interface
+ at the GUI handoff — feeding them a non-IONetworkController object => wrong-vtable dispatch => triple-fault.
+ The hack only existed to support the Skywalk bridging we have now removed (prepareBSDInterface/registerService),
+ so the bsdInterface is now a plain IOEthernetInterface whose provider is its real controller. Return that.
  */
 IOService *AirportItlwmEthernetInterface::
 getProvider() const
 {
-    return isAttach ? this->interface : super::getProvider();
+    return super::getProvider();
 }
 
 errno_t AirportItlwmEthernetInterface::

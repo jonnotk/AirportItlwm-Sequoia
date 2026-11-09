@@ -29,7 +29,16 @@ typedef UInt kIO80211InterfaceType;
 	*/
 #define kIO80211InterfaceClass     "IO80211Interface"
 
+#ifndef IO80211_FLOW_QUEUE_HASH_DECLARED
+#define IO80211_FLOW_QUEUE_HASH_DECLARED
+#if __IO80211_TARGET >= __MAC_15_0
+struct IO80211FlowQueueHash {
+    UInt64 value;
+};
+#else
 typedef UInt64 IO80211FlowQueueHash;
+#endif
+#endif
 class RSNSupplicant;
 class IOTimerEventSource;
 class IOGatedOutputQueue;
@@ -284,4 +293,3 @@ protected:
 #endif /* defined(KERNEL) && defined(__cplusplus) */
 
 #endif /* ! _IO80211INTERFACE_H */
-

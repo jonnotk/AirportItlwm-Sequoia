@@ -255,27 +255,14 @@ IOReturn AirportItlwm::
 setCIPHER_KEY(OSObject *object, struct apple80211_key *key)
 {
     XYLog("%s\n", __FUNCTION__);
-    const char* keydump = hexdump(key->key, key->key_len);
-    const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
-    const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kek_len) == 120, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_key) == 104, "struct corrupted");
-    if (keydump && rscdump && eadump)
-        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
-              key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
-    else
-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
-    
-    if (keydump)
-        IOFree((void*)keydump, 3 * key->key_len + 1);
-    if (rscdump)
-        IOFree((void*)rscdump, 3 * key->key_rsc_len + 1);
-    if (eadump)
-        IOFree((void*)eadump, 3 * APPLE80211_ADDR_LEN + 1);
-    
+    XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d rsc_len=%d\n",
+          key->key_len, key->key_cipher_type, key->key_flags, key->key_index, key->key_rsc_len);
+
     switch (key->key_cipher_type) {
         case APPLE80211_CIPHER_NONE:
             // clear existing key

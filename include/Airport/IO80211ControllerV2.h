@@ -123,6 +123,7 @@ struct apple80211_extended_stats;
 struct apple80211_ampdu_stat_report;
 struct apple80211_btCoex_report;
 struct apple80211_cca_report;
+struct apple80211_platform_config;
 class CCPipe;
 struct apple80211_lteCoex_report;
 
@@ -157,82 +158,70 @@ public:
     virtual IOReturn setHardwareAddress(const IOEthernetAddress * addrP) APPLE_KEXT_OVERRIDE;
     virtual IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
     virtual IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
+    // === IO80211Controller-introduced virtuals — EXACT Apple Sequoia vtable order (slots 396-465).
+    // Reconstructed from live BootKernelExtensions.kc (docs/.../vtable-analysis/). Order is ABI-critical:
+    // Apple's IO80211Family dispatches into this controller by these slot indices. DO NOT reorder.
+#if __IO80211_TARGET >= __MAC_15_0
+    virtual SInt32 isCommandProhibited(int) = 0;
+#else
     virtual bool isCommandProhibited(int) = 0;
-    virtual bool createWorkQueue();
+#endif                                                   // 396 pure
+    virtual bool createWorkQueue();                                                              // 397
+    virtual void debugStateInit();                                                               // 398 import
+#if __IO80211_TARGET >= __MAC_15_0
+    virtual IO80211WorkQueue *getWorkQueue() const;
+#else
     virtual IO80211WorkQueue *getWorkQueue();
-    virtual void requestPacketTx(void*, UInt);
-    virtual IOCommandGate *getIO80211CommandGate();
-    virtual IOReturn getHardwareAddressForInterface(IOEthernetAddress *);
-    virtual bool useAppleRSNSupplicant(IO80211VirtualInterface *);
-    virtual IO80211SkywalkInterface* getPrimarySkywalkInterface(void);
-    virtual int bpfOutputPacket(OSObject *,UInt,mbuf_t m);
-    virtual SInt32 monitorModeSetEnabled(bool, UInt);
-    virtual SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *, bool, bool);
-    virtual SInt32 apple80211VirtualRequest(UInt,int,IO80211VirtualInterface *,void *);
-    virtual SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *);
-    virtual SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *,void *);
-    
-    virtual SInt32 handleCardSpecific(IO80211SkywalkInterface *,unsigned long,void *,bool) = 0;
-    
-    virtual UInt32 hardwareOutputQueueDepth();
-    virtual SInt32 performCountryCodeOperation(IO80211CountryCodeOp);
-    
-    virtual void dataLinkLayerAttachComplete();
-    virtual SInt32 enableFeature(IO80211FeatureCode, void*) = 0;
-    
-    virtual IOReturn getDRIVER_VERSION(IO80211SkywalkInterface *,apple80211_version_data *) = 0;
-    virtual IOReturn getHARDWARE_VERSION(IO80211SkywalkInterface *,apple80211_version_data *) = 0;
-    virtual IOReturn getCARD_CAPABILITIES(IO80211SkywalkInterface *,apple80211_capability_data *) = 0;
-    virtual IOReturn getPOWER(IO80211SkywalkInterface *,apple80211_power_data *) = 0;
-    virtual IOReturn setPOWER(IO80211SkywalkInterface *,apple80211_power_data *) = 0;
-    virtual IOReturn getCOUNTRY_CODE(IO80211SkywalkInterface *,apple80211_country_code_data *) = 0;
-    virtual IOReturn setCOUNTRY_CODE(IO80211SkywalkInterface *,apple80211_country_code_data *) = 0;
-    virtual IOReturn setGET_DEBUG_INFO(IO80211SkywalkInterface *,apple80211_debug_command *) = 0;
-    
-    virtual SInt32 setVirtualHardwareAddress(IO80211VirtualInterface *,ether_addr *);
-    virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *);
-    virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *);
-    virtual bool requiresExplicitMBufRelease();
-    virtual bool flowIdSupported() {
-        return false;
-    }
-    virtual IO80211FlowQueueLegacy* requestFlowQueue(FlowIdMetadata const*);
-    virtual void releaseFlowQueue(IO80211FlowQueue *);
-    virtual bool getLogPipes(CCPipe**, CCPipe**, CCPipe**);
-    virtual void enableFeatureForLoggingFlags(unsigned long long) {};
-    virtual IOReturn requestQueueSizeAndTimeout(unsigned short *, unsigned short *) { return kIOReturnIOError; };
-    virtual IOReturn enablePacketTimestamping(void) {
-        return kIOReturnUnsupported;
-    }
-    virtual IOReturn disablePacketTimestamping(void) {
-        return kIOReturnUnsupported;
-    }
-    
-    virtual UInt getPacketTSCounter();
-    virtual void *getDriverTextLog();
-    
-    virtual UInt32 selfDiagnosticsReport(int,char const*,UInt);
-    
-    virtual void *getFaultReporterFromDriver();
-    
-    virtual UInt32 getDataQueueDepth(OSObject *);
-    virtual bool isAssociatedToMovingNetwork(void) { return false; }
-    virtual bool wasDynSARInFailSafeMode(void) { return false; }
-    virtual void updateAdvisoryScoresIfNeed(void);
-    virtual UInt64 getAVCAdvisoryInfo(IO80211InterfaceAVCAdvisory *);
-    virtual SInt32 apple80211_ioctl_get(IO80211SkywalkInterface *,void *, bool, bool);
-    virtual SInt32 apple80211_ioctl_set(IO80211SkywalkInterface *,void *, bool, bool);
-    virtual bool attachInterface(OSObject *,IOService *);
-    virtual SInt32 apple80211_ioctl_get(IO80211VirtualInterface *,void *,bool,bool);
-    virtual SInt32 apple80211_ioctl_set(IO80211VirtualInterface *,void *,bool,bool);
-    virtual void detachInterface(OSObject *,bool);
-    virtual IO80211VirtualInterface* createVirtualInterface(ether_addr *,UInt);
-    virtual bool attachVirtualInterface(IO80211VirtualInterface **,ether_addr *,UInt,bool);
-    virtual bool detachVirtualInterface(IO80211VirtualInterface *,bool);
-    virtual IOReturn enable(IO80211SkywalkInterface *);
-    virtual IOReturn disable(IO80211SkywalkInterface *);
-    
-    OSMetaClassDeclareReservedUnused( IO80211Controller,  0);
+#endif                                                    // 399
+    virtual void requestPacketTx(void*, UInt);                                                   // 400
+    virtual IOCommandGate *getIO80211CommandGate() const;                                        // 401
+    virtual IO80211SkywalkInterface* getPrimarySkywalkInterface(void);                           // 402
+    virtual int bpfOutputPacket(OSObject *,UInt,mbuf_t m);                                       // 403
+    virtual SInt32 monitorModeSetEnabled(bool, UInt);                                            // 404
+    virtual SInt32 handleCardSpecific(IO80211SkywalkInterface *,unsigned long,void *,bool) = 0;  // 405 pure
+    virtual UInt32 hardwareOutputQueueDepth();                                                   // 406
+    virtual SInt32 performCountryCodeOperation(IO80211CountryCodeOp);                            // 407
+    virtual void dataLinkLayerAttachComplete();                                                  // 408
+    virtual SInt32 enableFeature(IO80211FeatureCode, void*) = 0;                                 // 409 pure
+    virtual IOReturn getDRIVER_VERSION(IO80211SkywalkInterface *,apple80211_version_data *) = 0;        // 410
+    virtual IOReturn getHARDWARE_VERSION(IO80211SkywalkInterface *,apple80211_version_data *) = 0;      // 411
+    virtual IOReturn getCARD_CAPABILITIES(IO80211SkywalkInterface *,apple80211_capability_data *) = 0;  // 412
+    virtual IOReturn getPOWER(IO80211SkywalkInterface *,apple80211_power_data *) = 0;                   // 413
+    virtual IOReturn setPOWER(IO80211SkywalkInterface *,apple80211_power_data *) = 0;                   // 414
+    virtual IOReturn getCOUNTRY_CODE(IO80211SkywalkInterface *,apple80211_country_code_data *) = 0;     // 415
+    virtual IOReturn setCOUNTRY_CODE(IO80211SkywalkInterface *,apple80211_country_code_data *) = 0;     // 416
+    virtual IOReturn setGET_DEBUG_INFO(IO80211SkywalkInterface *,apple80211_debug_command *) = 0;       // 417
+    virtual IOReturn getPLATFORM_CONFIG(IO80211SkywalkInterface *,apple80211_platform_config *);        // 418 import
+    virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *);                            // 419
+    virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *);                           // 420
+    virtual bool requiresExplicitMBufRelease();                                                  // 421
+    virtual bool flowIdSupported() { return false; }                                             // 422
+    virtual IO80211FlowQueueLegacy* requestFlowQueue(FlowIdMetadata const*);                     // 423
+    virtual void releaseFlowQueue(IO80211FlowQueue *);                                           // 424
+    virtual bool getLogPipes(CCPipe**, CCPipe**, CCPipe**);                                      // 425
+    virtual void *getLogger() const = 0;                                                         // 426 pure (AirportItlwm impl)
+    virtual void enableFeatureForLoggingFlags(unsigned long long) {};                            // 427
+    virtual IOReturn requestQueueSizeAndTimeout(unsigned short *, unsigned short *) { return kIOReturnIOError; };  // 428
+    virtual IOReturn enablePacketTimestamping(void) { return kIOReturnUnsupported; }             // 429
+    virtual IOReturn disablePacketTimestamping(void) { return kIOReturnUnsupported; }            // 430
+    virtual UInt getPacketTSCounter();                                                           // 431
+    virtual void *getDriverTextLog();                                                            // 432
+    virtual UInt32 selfDiagnosticsReport(int,char const*,UInt);                                  // 433
+    virtual void *getFaultReporterFromDriver();                                                  // 434 (AirportItlwm impl)
+    virtual void *allocIO80211RecursiveLock();                                                   // 435 import
+    virtual UInt32 getDataQueueDepth(OSObject *);                                                // 436
+    virtual bool wasDynSARInFailSafeMode(void) { return false; }                                 // 437
+    virtual void updateAdvisoryScoresIfNeed(void);                                               // 438
+    virtual UInt64 getAVCAdvisoryInfo(IO80211InterfaceAVCAdvisory *);                            // 439
+    virtual unsigned int getActionFramePoolCapacity();                                           // 440 import
+    virtual void *getPostOffice();                                                               // 441 import
+    virtual void *CreatePostOffice();                                                            // 442 import
+    virtual bool attachInterface(OSObject *,IOService *);                                        // 443
+    virtual void detachInterface(OSObject *,bool);                                               // 444
+    virtual IO80211VirtualInterface* createVirtualInterface(ether_addr *,UInt);                  // 445
+    virtual bool attachVirtualInterface(IO80211VirtualInterface **,ether_addr *,UInt,bool);      // 446
+    virtual bool detachVirtualInterface(IO80211VirtualInterface *,bool);                         // 447
+    OSMetaClassDeclareReservedUnused( IO80211Controller,  0);                                    // 448
     OSMetaClassDeclareReservedUnused( IO80211Controller,  1);
     OSMetaClassDeclareReservedUnused( IO80211Controller,  2);
     OSMetaClassDeclareReservedUnused( IO80211Controller,  3);
@@ -247,10 +236,28 @@ public:
     OSMetaClassDeclareReservedUnused( IO80211Controller, 12);
     OSMetaClassDeclareReservedUnused( IO80211Controller, 13);
     OSMetaClassDeclareReservedUnused( IO80211Controller, 14);
-    OSMetaClassDeclareReservedUnused( IO80211Controller, 15);
-    
-    virtual void postMessage(UInt,void *,unsigned long,UInt,void *);
-    virtual IOReturn setMulticastList(ether_addr const*, UInt);
+    OSMetaClassDeclareReservedUnused( IO80211Controller, 15);                                    // 463
+public:
+    virtual IOReturn setMulticastList(ether_addr const*, UInt);                                  // 464
+
+    // === Non-virtual helpers: NOT in Apple's IO80211Controller vtable.
+    // Kept as ordinary methods so they occupy NO vtable slot; AirportItlwm calls them directly.
+    IOReturn getHardwareAddressForInterface(IOEthernetAddress *);
+    bool useAppleRSNSupplicant(IO80211VirtualInterface *);
+    // Inline stub bodies: these are NOT Apple IO80211Controller symbols, so AirportItlwm's
+    // `super::X` calls must resolve to a local definition (else the kext fails to prelink at boot).
+    SInt32 apple80211_ioctl(IO80211SkywalkInterface *,unsigned long,void *, bool, bool) { return kIOReturnUnsupported; }
+    SInt32 apple80211VirtualRequest(UInt,int,IO80211VirtualInterface *,void *) { return kIOReturnUnsupported; }
+    SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *) { return kIOReturnUnsupported; }
+    SInt32 apple80211SkywalkRequest(UInt,int,IO80211SkywalkInterface *,void *,void *) { return kIOReturnUnsupported; }
+    SInt32 setVirtualHardwareAddress(IO80211VirtualInterface *,ether_addr *) { return kIOReturnUnsupported; }
+    SInt32 apple80211_ioctl_get(IO80211SkywalkInterface *,void *, bool, bool) { return kIOReturnUnsupported; }
+    SInt32 apple80211_ioctl_set(IO80211SkywalkInterface *,void *, bool, bool) { return kIOReturnUnsupported; }
+    SInt32 apple80211_ioctl_get(IO80211VirtualInterface *,void *,bool,bool) { return kIOReturnUnsupported; }
+    SInt32 apple80211_ioctl_set(IO80211VirtualInterface *,void *,bool,bool) { return kIOReturnUnsupported; }
+    IOReturn enable(IO80211SkywalkInterface *) { return kIOReturnSuccess; }
+    IOReturn disable(IO80211SkywalkInterface *) { return kIOReturnSuccess; }
+    bool isAssociatedToMovingNetwork(void) { return false; }
 
 protected:
     uint8_t  filler[0x128];

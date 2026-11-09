@@ -34,6 +34,11 @@
 			<integer>70000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIEDeviceWrapper</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>AirportItlwmControllerMatch</key>
+				<true/>
+			</dict>
 			<key>IOResourceMatch</key>
 			<string>IOBSD</string>
 		</dict>

@@ -95,6 +95,33 @@ public:
 #endif
     
     void releaseAll();
+    bool cleanupLegacy(IOService *provider, bool freeing = false);
+    bool fLegacyCleanupInProgress = false, fLegacyStartInProgress = false, fLegacyBaseStarted = false, fLegacyBaseStartInProgress = false;
+    bool fLegacyHalAttachAttempted = false, fLegacyHalAttached = false, fLegacyHalAttachInProgress = false;
+    bool fLegacyInterfaceAttached = false, fLegacyInterfaceAttachInProgress = false;
+    bool fLegacyChildTerminationRequested = false, fLegacyEthernetAttached = false, fLegacyCommandGateAdded = false;
+    void closeControllerTimerAdmission();
+    bool holdControllerTimerOwner();
+    bool quiesceControllerTimers();
+    bool releaseControllerTimerReferences();
+    bool controllerTimersClosing();
+    bool armControllerWatchdog();
+    struct ControllerTimerFrame {
+        AirportItlwm *owner = NULL;
+        void *thread = NULL;
+        ControllerTimerFrame *next = NULL;
+        IOTimerEventSource *source = NULL;
+        bool rearm = false;
+        ~ControllerTimerFrame();
+    };
+    bool beginControllerTimer(ControllerTimerFrame *, IOTimerEventSource *, bool scan);
+    void endControllerTimer(ControllerTimerFrame *);
+    IOLock *fControllerTimerLock;
+    bool fControllerTimerClosing, fControllerTimerDraining, fControllerTimerOwnerHeld;
+    ControllerTimerFrame *fControllerTimerFrames;
+    IOTimerEventSource *fRetiredWatchdogTimer, *fRetiredScanTimer;
+    bool fWatchdogTimerAdded, fScanSourceAdded;
+
     void associateSSID(uint8_t *ssid, uint32_t ssid_len, const struct ether_addr &bssid, uint32_t authtype_lower, uint32_t authtype_upper, uint8_t *key, uint32_t key_len, int key_index);
     void setPTK(const u_int8_t *key, size_t key_len);
     void setGTK(const u_int8_t *key, size_t key_len, u_int8_t kid, u_int8_t *rsc);
@@ -229,7 +256,10 @@ public:
     virtual IOReturn setWakeOnMagicPacket( bool active ) override;
     void setPowerStateOff(void);
     void setPowerStateOn(void);
-    void unregistPM();
+    bool unregistPM(bool permanent = true);
+    struct PowerCallFrame { void *thread; PowerCallFrame *next; };
+    void beginPowerCall(PowerCallFrame *);
+    void endPowerCall(PowerCallFrame *);
     
     bool createMediumTables(const IONetworkMedium **primary);
     virtual IOReturn getPacketFilters(const OSSymbol *group, UInt32 *filters) const override;
@@ -239,15 +269,19 @@ public:
 public:
     IOInterruptEventSource* fInterrupt;
     IOTimerEventSource *watchdogTimer;
-    IOPCIDevice *pciNub;
-    IONetworkStats *fpNetStats;
-    AirportItlwmInterface *fNetIf;
-    IOWorkLoop *fWatchdogWorkLoop;
-    ItlHalService *fHalService;
+    IOPCIDevice *pciNub = NULL;
+    IONetworkStats *fpNetStats = NULL;
+    AirportItlwmInterface *fNetIf = NULL;
+    IOWorkLoop *fWatchdogWorkLoop = NULL;
+    ItlHalService *fHalService = NULL;
     
     //pm
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
+    IOLock *fPowerCallLock;
+    bool fPowerCallAdmission, fPowerCallStopping, fPowerCallDraining, fPowerCallOwnerHeld;
+    PowerCallFrame *fPowerCallFrames;
+    unsigned fPowerCallOutstanding;
     UInt32 pmPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;

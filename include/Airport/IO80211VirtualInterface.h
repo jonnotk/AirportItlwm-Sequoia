@@ -4,7 +4,16 @@
 #include "IO80211Interface.h"
 #include "apple_private_spi.h"
 
+#ifndef IO80211_FLOW_QUEUE_HASH_DECLARED
+#define IO80211_FLOW_QUEUE_HASH_DECLARED
+#if __IO80211_TARGET >= __MAC_15_0
+struct IO80211FlowQueueHash {
+    UInt64 value;
+};
+#else
 typedef UInt64 IO80211FlowQueueHash;
+#endif
+#endif
 typedef UInt kIO80211InterfaceType;
 class IO80211PeerManager;
 class RSNSupplicant;

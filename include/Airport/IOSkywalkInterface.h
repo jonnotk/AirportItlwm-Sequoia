@@ -29,7 +29,14 @@ public:
     virtual IOReturn clientConnectWithTask( task_t task, IOService * forClient, IOOptionBits options );
     virtual void clientDisconnect( IOService * forClient, IOOptionBits options );
     virtual bool isTerminating(void);
-    
+
+    // Non-virtual datapath registration entry points (do NOT affect vtable/layout).
+    // KC: __ZN18IOSkywalkInterface27registerInterfaceWithQueuesEPP20IOSkywalkPacketQueuejP25IOSkywalkPacketBufferPoolS4_j
+    IOReturn registerInterfaceWithQueues(class IOSkywalkPacketQueue **queues, UInt32 count,
+                                         class IOSkywalkPacketBufferPool *pool1,
+                                         class IOSkywalkPacketBufferPool *pool2, IOOptionBits options);
+    IOReturn deregisterInterfaceWithQueues(void);
+
     OSMetaClassDeclareReservedUnused( IOSkywalkInterface,  0 );
     OSMetaClassDeclareReservedUnused( IOSkywalkInterface,  1 );
     OSMetaClassDeclareReservedUnused( IOSkywalkInterface,  2 );

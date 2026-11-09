@@ -16,6 +16,14 @@
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
 #include <net80211/ieee80211_var.h>
+#include <HAL/AiritlDebug.h>
+
+// Gated debug logging (see include/HAL/AiritlDebug.h). This target's own
+// definition: the pre-Sonoma AirportItlwm targets compile neither
+// AirportItlwmV2.cpp nor itlwm.cpp, but share HAL files that use AIRITL_DBG.
+extern "C" {
+int airitl_debug_log = 0;
+}
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
@@ -24,13 +32,37 @@ OSDefineMetaClassAndStructors(CTimeout, OSObject)
 IO80211WorkLoop *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
+#define ITL_CONTROLLER_CLASS AirportItlwm
+#define ITL_CONTROLLER_HAS_SCAN 1
+#include <HAL/ItlControllerTimers.inc>
+#undef ITL_CONTROLLER_HAS_SCAN
+#undef ITL_CONTROLLER_CLASS
+
 bool AirportItlwm::init(OSDictionary *properties)
 {
     bool ret = super::init(properties);
     awdlSyncEnable = true;
     power_state = 0;
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
-    return ret;
+    fPowerCallLock = ret ? IOLockAlloc() : NULL;
+    fPowerCallAdmission = fPowerCallStopping = fPowerCallDraining = fPowerCallOwnerHeld = false;
+    fPowerCallFrames = NULL;
+    fPowerCallOutstanding = 0;
+    powerOffThreadCall = powerOnThreadCall = NULL;
+    pmPolicyMaker = NULL;
+    pmPowerState = kPowerStateOn;
+    fControllerTimerLock = ret ? IOLockAlloc() : NULL;
+    fControllerTimerClosing = fControllerTimerDraining = fControllerTimerOwnerHeld = false;
+    fControllerTimerFrames = NULL;
+    fRetiredWatchdogTimer = fRetiredScanTimer = NULL;
+    fWatchdogTimerAdded = fScanSourceAdded = false;
+    watchdogTimer = NULL;
+    scanSource = NULL;
+    fLegacyCleanupInProgress = fLegacyStartInProgress = fLegacyBaseStarted = fLegacyBaseStartInProgress = false;
+    fLegacyHalAttachAttempted = fLegacyHalAttached = fLegacyHalAttachInProgress = false;
+    fLegacyInterfaceAttached = fLegacyInterfaceAttachInProgress = false;
+    fLegacyChildTerminationRequested = fLegacyEthernetAttached = fLegacyCommandGateAdded = false;
+    return ret && fPowerCallLock && fControllerTimerLock;
 }
 
 #define  PCI_MSI_FLAGS        2    /* Message Control */
@@ -65,8 +97,8 @@ IOService* AirportItlwm::probe(IOService *provider, SInt32 *score)
 {
     bool isMatch = false;
     super::probe(provider, score);
-    UInt8 msiCap;
-    UInt8 msixCap;
+    UInt8 msiCap = 0;
+    UInt8 msixCap = 0;
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
     if (!device)
         return NULL;
@@ -82,6 +114,8 @@ IOService* AirportItlwm::probe(IOService *provider, SInt32 *score)
         isMatch = true;
         fHalService = new ItlIwn;
     }
+    if (isMatch && !fHalService)
+        return NULL;
     if (isMatch) {
         device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
         if (msixCap)
@@ -117,6 +151,9 @@ bool AirportItlwm::configureInterface(IONetworkInterface *netif)
     }
     ifp->netStat = fpNetStats;
     ether_ifattach(ifp, OSDynamicCast(IOEthernetInterface, netif));
+    IOLockLock(fControllerTimerLock);
+    fLegacyEthernetAttached = true;
+    IOLockUnlock(fControllerTimerLock);
     fpNetStats->collisions = 0;
 #ifdef __PRIVATE_SPI__
     netif->configureOutputPullModel(fHalService->getDriverInfo()->getTxQueueSize(), 0, 0, IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0);
@@ -300,8 +337,7 @@ void AirportItlwm::setGTK(const u_int8_t *gtk, size_t key_len, u_int8_t kid, u_i
         {
             XYLog("marking port %s valid\n",
                   ether_sprintf(ni->ni_macaddr));
-            ni->ni_port_valid = 1;
-            ieee80211_set_link_state(ic, LINK_STATE_UP);
+            ieee80211_authorize_port(ic, ni);
             ni->ni_assoc_fail = 0;
             if (ic->ic_opmode == IEEE80211_M_STA)
                 ic->ic_rsngroupcipher = ni->ni_rsngroupcipher;
@@ -314,6 +350,8 @@ bool AirportItlwm::
 createMediumTables(const IONetworkMedium **primary)
 {
     IONetworkMedium    *medium;
+    if (primary)
+        *primary = NULL;
     
     OSDictionary *mediumDict = OSDictionary::withCapacity(1);
     if (mediumDict == NULL) {
@@ -322,15 +360,18 @@ createMediumTables(const IONetworkMedium **primary)
     }
     
     medium = IONetworkMedium::medium(0x80, 11000000);
-    IONetworkMedium::addMedium(mediumDict, medium);
-    medium->release();
-    if (primary) {
-        *primary = medium;
+    if (!medium || !IONetworkMedium::addMedium(mediumDict, medium)) {
+        if (medium) medium->release();
+        mediumDict->release();
+        return false;
     }
+    medium->release();
     
     bool result = publishMediumDictionary(mediumDict);
     if (!result)
         XYLog("Cannot publish medium dictionary!\n");
+    if (result && primary)
+        *primary = medium;
 
     mediumDict->release();
     return result;
@@ -338,19 +379,42 @@ createMediumTables(const IONetworkMedium **primary)
 
 bool AirportItlwm::start(IOService *provider)
 {
+    if (!fControllerTimerLock) return false;
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing || fLegacyStartInProgress || fLegacyBaseStarted) {
+        IOLockUnlock(fControllerTimerLock);
+        return false;
+    }
+    fLegacyStartInProgress = fLegacyBaseStartInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    struct StartOwner {
+        AirportItlwm *owner;
+        ~StartOwner() { owner->release(); }
+    } startOwner{this};
+    retain();
+    auto failStart = [this, provider]() -> bool {
+        IOLockLock(fControllerTimerLock);
+        fLegacyStartInProgress = false;
+        IOLockUnlock(fControllerTimerLock);
+        cleanupLegacy(provider);
+        return false;
+    };
     int boot_value = 0;
-    if (!super::start(provider)) {
-        return false;
-    }
-    if (!serviceMatching("AppleSMC")) {
-        super::stop(provider);
+    const bool baseStarted = super::start(provider);
+    IOLockLock(fControllerTimerLock);
+    fLegacyBaseStartInProgress = false;
+    fLegacyBaseStarted = baseStarted;
+    IOLockUnlock(fControllerTimerLock);
+    if (!baseStarted || controllerTimersClosing()) return failStart();
+    OSDictionary *smcMatching = serviceMatching("AppleSMC");
+    if (!smcMatching) {
         XYLog("No matching AppleSMC dictionary, failing\n");
-        return false;
+        return failStart();
     }
+    smcMatching->release();
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
-        super::stop(provider);
-        return false;
+        return failStart();
     }
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
@@ -358,94 +422,118 @@ bool AirportItlwm::start(IOService *provider)
     pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
-        super::stop(provider);
-        return false;
+        return failStart();
     }
     if (initPCIPowerManagment(pciNub) == false) {
-        super::stop(pciNub);
-        return false;
+        return failStart();
     }
     if (_fWorkloop == NULL) {
         XYLog("No _fWorkloop!!\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
     _fCommandGate = IOCommandGate::commandGate(this, (IOCommandGate::Action)AirportItlwm::tsleepHandler);
     if (_fCommandGate == 0) {
         XYLog("No command gate!!\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    _fWorkloop->addEventSource(_fCommandGate);
+    if (_fWorkloop->addEventSource(_fCommandGate) != kIOReturnSuccess) return failStart();
+    fLegacyCommandGateAdded = true;
     const IONetworkMedium *primaryMedium;
     if (!createMediumTables(&primaryMedium) ||
         !setCurrentMedium(primaryMedium) || !setSelectedMedium(primaryMedium)) {
         XYLog("setup medium fail\n");
-        releaseAll();
-        return false;
+        return failStart();
     }
-    fHalService->initWithController(this, _fWorkloop, _fCommandGate);
+    if (!fHalService->initWithController(this, _fWorkloop, _fCommandGate)) {
+        return failStart();
+    }
     fHalService->get80211Controller()->ic_event_handler = eventHandler;
     
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
+    airitl_debug_log = PE_parse_boot_argn("-airitldbg", &boot_value, sizeof(boot_value)) ? 1 : 0;
     
-    if (!fHalService->attach(pciNub)) {
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing) { IOLockUnlock(fControllerTimerLock); return failStart(); }
+    fLegacyHalAttachAttempted = fLegacyHalAttachInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    const bool halAttached = fHalService->attach(pciNub);
+    IOLockLock(fControllerTimerLock);
+    fLegacyHalAttached = halAttached;
+    fLegacyHalAttachInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (!halAttached || controllerTimersClosing()) {
         XYLog("attach fail\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    if (!attachInterface((IONetworkInterface **)&fNetIf, true)) {
+    IOLockLock(fControllerTimerLock);
+    if (fControllerTimerClosing) { IOLockUnlock(fControllerTimerLock); return failStart(); }
+    fLegacyInterfaceAttachInProgress = true;
+    IOLockUnlock(fControllerTimerLock);
+    const bool childAttached = attachInterface((IONetworkInterface **)&fNetIf, true);
+    IOLockLock(fControllerTimerLock);
+    fLegacyInterfaceAttached = childAttached;
+    fLegacyInterfaceAttachInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (!childAttached || controllerTimersClosing()) {
         XYLog("attach to interface fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
     fWatchdogWorkLoop = IOWorkLoop::workLoop();
     if (fWatchdogWorkLoop == NULL) {
         XYLog("init watchdog workloop fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
+    if (!holdControllerTimerOwner()) return failStart();
     watchdogTimer = IOTimerEventSource::timerEventSource(this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &AirportItlwm::watchdogAction));
     if (!watchdogTimer) {
         XYLog("init watchdog fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return failStart();
     }
-    fWatchdogWorkLoop->addEventSource(watchdogTimer);
+    if (fWatchdogWorkLoop->addEventSource(watchdogTimer) != kIOReturnSuccess) {
+        return failStart();
+    }
+    fWatchdogTimerAdded = true;
     scanSource = IOTimerEventSource::timerEventSource(this, &fakeScanDone);
-    _fWorkloop->addEventSource(scanSource);
+    if (!scanSource || _fWorkloop->addEventSource(scanSource) != kIOReturnSuccess) {
+        return failStart();
+    }
+    fScanSourceAdded = true;
     scanSource->enable();
     setLinkStatus(kIONetworkLinkValid);
     if (TAILQ_EMPTY(&fHalService->get80211Controller()->ic_ess))
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
     registerService();
     fNetIf->registerService();
+    IOLockLock(fControllerTimerLock);
+    const bool closed = fControllerTimerClosing;
+    fLegacyStartInProgress = false;
+    IOLockUnlock(fControllerTimerLock);
+    if (closed) return failStart();
     return true;
 }
 
 void AirportItlwm::watchdogAction(IOTimerEventSource *timer)
 {
-    struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
-    (*ifp->if_watchdog)(ifp);
-    watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+    ControllerTimerFrame frame;
+    if (!beginControllerTimer(&frame, timer, false)) return;
+    if (fHalService) {
+        auto *ic = fHalService->get80211Controller();
+        if (ic && ic->ic_ac.ac_if.if_watchdog)
+            (*ic->ic_ac.ac_if.if_watchdog)(&ic->ic_ac.ac_if);
+    }
 }
 
 void AirportItlwm::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
 {
-    AirportItlwm *that = (AirportItlwm *)owner;
-    that->getNetworkInterface()->postMessage(APPLE80211_M_SCAN_DONE);
+    auto *that = OSDynamicCast(AirportItlwm, owner);
+    if (!that) return;
+    ControllerTimerFrame frame;
+    if (!that->beginControllerTimer(&frame, sender, true)) return;
+    if (that->getNetworkInterface())
+        that->getNetworkInterface()->postMessage(APPLE80211_M_SCAN_DONE);
 }
 
 const OSString * AirportItlwm::newVendorString() const
@@ -502,16 +590,7 @@ IOReturn AirportItlwm::selectMedium(const IONetworkMedium *medium)
 
 void AirportItlwm::stop(IOService *provider)
 {
-    XYLog("%s\n", __FUNCTION__);
-    struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
-    super::stop(provider);
-    disableAdapter(fNetIf);
-    setLinkStatus(kIONetworkLinkValid);
-    fHalService->detach(pciNub);
-    ether_ifdetach(ifp);
-    detachInterface(fNetIf, true);
-    OSSafeReleaseNULL(fNetIf);
-    releaseAll();
+    cleanupLegacy(provider);
 }
 
 bool AirportItlwm::
@@ -557,47 +636,101 @@ setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *ar
     return ret;
 }
 
+bool AirportItlwm::cleanupLegacy(IOService *provider, bool freeing)
+{
+    struct Lifetime {
+        AirportItlwm *owner;
+        bool held;
+        ~Lifetime() { if (held) owner->release(); }
+    } lifetime{this, !freeing};
+    if (!freeing) retain();
+    closeControllerTimerAdmission();
+    if (fControllerTimerLock) IOLockLock(fControllerTimerLock);
+    if (fLegacyCleanupInProgress) {
+        if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+        return false;
+    }
+    fLegacyCleanupInProgress = true;
+    if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+    struct CleanupOwner {
+        AirportItlwm *owner;
+        ~CleanupOwner() {
+            if (owner->fControllerTimerLock) IOLockLock(owner->fControllerTimerLock);
+            owner->fLegacyCleanupInProgress = false;
+            if (owner->fControllerTimerLock) IOLockUnlock(owner->fControllerTimerLock);
+        }
+    } cleanupOwner{this};
+    if (fControllerTimerLock) IOLockLock(fControllerTimerLock);
+    const bool starting = fLegacyStartInProgress || fLegacyBaseStartInProgress ||
+        fLegacyHalAttachInProgress || fLegacyInterfaceAttachInProgress;
+    if (fControllerTimerLock) IOLockUnlock(fControllerTimerLock);
+    if (starting) return false;
+    const bool pmQuiesced = unregistPM();
+    const bool timersQuiesced = quiesceControllerTimers();
+    if (!pmQuiesced || !timersQuiesced) return false;
+    if (_fWorkloop && _fWorkloop->inGate()) return false;
+    if (fHalService && !fHalService->quiesceForDetach()) return false;
+    if (fHalService && fHalService->teardownMustRetainResources()) return false;
+    auto *ic = fHalService ? fHalService->get80211Controller() : NULL;
+    if (fNetIf) {
+        auto *child = fNetIf;
+        child->retain();
+        auto *childProvider = child->getProvider();
+        if (childProvider && childProvider != this) { child->release(); return false; }
+        if (!childProvider && !fLegacyInterfaceAttached && !fLegacyChildTerminationRequested) {
+            child->release();
+            return false;
+        }
+        if (childProvider == this && !fLegacyChildTerminationRequested) {
+            fLegacyInterfaceAttached = true;
+            fLegacyChildTerminationRequested = true;
+            detachInterface(child, true);
+        }
+        const bool stopped = child->getProvider() == NULL;
+        child->release();
+        // Native stop and provider close precede actual detach. A sync request
+        // may enqueue or time out; preserve dependencies for external retry.
+        if (!stopped) return false;
+        fLegacyInterfaceAttached = false;
+    } else if (fLegacyInterfaceAttached) return false;
+    if (fLegacyBaseStarted) {
+        fLegacyBaseStarted = false;
+        super::stop(provider);
+    }
+    fNextNodeToSend = NULL;
+    if (fLegacyHalAttachAttempted && fHalService) {
+        fHalService->detach(pciNub);
+        if (fHalService->teardownMustRetainResources()) return false;
+        fLegacyHalAttachAttempted = fLegacyHalAttached = false;
+    }
+    if (fLegacyEthernetAttached && ic) {
+        ether_ifdetach(&ic->ic_ac.ac_if);
+        fLegacyEthernetAttached = false;
+    }
+    if (ic && ic->ic_ac.ac_if.netStat == fpNetStats) ic->ic_ac.ac_if.netStat = NULL;
+    fpNetStats = NULL;
+    OSSafeReleaseNULL(fNetIf);
+    if (_fCommandGate) {
+        if (fLegacyCommandGateAdded && (!_fWorkloop ||
+            _fWorkloop->removeEventSource(_fCommandGate) != kIOReturnSuccess)) return false;
+        fLegacyCommandGateAdded = false;
+        OSSafeReleaseNULL(_fCommandGate);
+    }
+    OSSafeReleaseNULL(fHalService);
+    OSSafeReleaseNULL(fWatchdogWorkLoop);
+    OSSafeReleaseNULL(_fWorkloop);
+    return releaseControllerTimerReferences();
+}
+
 void AirportItlwm::releaseAll()
 {
-    if (fHalService) {
-        fHalService->release();
-        fHalService = NULL;
-    }
-    if (_fWorkloop) {
-        if (_fCommandGate) {
-//            _fCommandGate->disable();
-            _fWorkloop->removeEventSource(_fCommandGate);
-            _fCommandGate->release();
-            _fCommandGate = NULL;
-        }
-        if (scanSource) {
-            scanSource->cancelTimeout();
-            scanSource->disable();
-            _fWorkloop->removeEventSource(scanSource);
-            scanSource->release();
-            scanSource = NULL;
-        }
-        if (fWatchdogWorkLoop && watchdogTimer) {
-            watchdogTimer->cancelTimeout();
-            fWatchdogWorkLoop->removeEventSource(watchdogTimer);
-            watchdogTimer->release();
-            watchdogTimer = NULL;
-            fWatchdogWorkLoop->release();
-            fWatchdogWorkLoop = NULL;
-        }
-        _fWorkloop->release();
-        _fWorkloop = NULL;
-    }
-    unregistPM();
+    cleanupLegacy(getProvider());
 }
 
 void AirportItlwm::free()
 {
+    if (!cleanupLegacy(getProvider(), true)) return;
     XYLog("%s\n", __FUNCTION__);
-    if (fHalService != NULL) {
-        fHalService->release();
-        fHalService = NULL;
-    }
     if (syncFrameTemplate != NULL && syncFrameTemplateLength > 0) {
         IOFree(syncFrameTemplate, syncFrameTemplateLength);
         syncFrameTemplateLength = 0;
@@ -611,11 +744,20 @@ void AirportItlwm::free()
         IOFree(btcProfile, sizeof(struct apple80211_btc_profiles_data));
         btcProfile = NULL;
     }
+    if (fPowerCallLock) {
+        IOLockFree(fPowerCallLock);
+        fPowerCallLock = NULL;
+    }
+    if (fControllerTimerLock) {
+        IOLockFree(fControllerTimerLock);
+        fControllerTimerLock = NULL;
+    }
     super::free();
 }
 
 IOReturn AirportItlwm::enable(IONetworkInterface *netif)
 {
+    if (controllerTimersClosing()) return kIOReturnNotReady;
     XYLog("%s\n", __PRETTY_FUNCTION__);
     super::enable(netif);
     _fCommandGate->enable();
@@ -634,14 +776,15 @@ IOReturn AirportItlwm::disable(IONetworkInterface *netif)
 
 IOReturn AirportItlwm::enableAdapter(IONetworkInterface *netif)
 {
+    if (controllerTimersClosing()) return kIOReturnNotReady;
     fHalService->enable(netif);
-    watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
-    watchdogTimer->enable();
+    if (!armControllerWatchdog()) return kIOReturnNotReady;
     return kIOReturnSuccess;
 }
 
 void AirportItlwm::disableAdapter(IONetworkInterface *netif)
 {
+    if (controllerTimersClosing()) return;
     watchdogTimer->cancelTimeout();
     watchdogTimer->disable();
     fHalService->disable(netif);
@@ -802,45 +945,122 @@ static IOPMPowerState powerStateArray[kPowerStateCount] =
     {1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0}
 };
 
-void AirportItlwm::unregistPM()
+void AirportItlwm::beginPowerCall(PowerCallFrame *frame)
 {
-    if (powerOffThreadCall) {
-        thread_call_free(powerOffThreadCall);
-        powerOffThreadCall = NULL;
+    IOLockLock(fPowerCallLock);
+    frame->thread = current_thread();
+    frame->next = fPowerCallFrames;
+    fPowerCallFrames = frame;
+    IOLockUnlock(fPowerCallLock);
+}
+
+void AirportItlwm::endPowerCall(PowerCallFrame *frame)
+{
+    IOLockLock(fPowerCallLock);
+    auto **link = &fPowerCallFrames;
+    while (*link && *link != frame) link = &(*link)->next;
+    if (*link) {
+        *link = frame->next;
+        --fPowerCallOutstanding;
     }
-    if (powerOnThreadCall) {
-        thread_call_free(powerOnThreadCall);
-        powerOnThreadCall = NULL;
+    IOLockUnlock(fPowerCallLock);
+}
+
+bool AirportItlwm::unregistPM(bool permanent)
+{
+    if (!fPowerCallLock) return true;
+    IOLockLock(fPowerCallLock);
+    fPowerCallAdmission = false;
+    fPowerCallStopping |= permanent;
+    unsigned selfFrames = 0;
+    for (auto *frame = fPowerCallFrames; frame; frame = frame->next)
+        selfFrames += frame->thread == current_thread();
+    if (fPowerCallDraining) {
+        IOLockUnlock(fPowerCallLock);
+        return false;
     }
+    fPowerCallDraining = true;
+    thread_call_t calls[2] = {powerOffThreadCall, powerOnThreadCall};
+    powerOffThreadCall = powerOnThreadCall = NULL;
+    IOLockUnlock(fPowerCallLock);
+    for (auto call : calls) {
+        if (call && thread_call_cancel(call)) {
+            IOLockLock(fPowerCallLock);
+            --fPowerCallOutstanding;
+            IOLockUnlock(fPowerCallLock);
+            release();
+        }
+    }
+    auto yieldGate = [this](void *event) {
+        IOCommandGate *gate = getCommandGate();
+        if (gate && gate->getWorkLoop() && gate->getWorkLoop()->inGate()) {
+            AbsoluteTime deadline;
+            clock_interval_to_deadline(10, kMillisecondScale,
+                reinterpret_cast<uint64_t *>(&deadline));
+            gate->commandSleep(event, deadline, THREAD_UNINT);
+        } else IOSleep(10);
+    };
+    if (selfFrames) {
+        // Plain thread calls overlap. Drain all other admitted driver bodies,
+        // including workers that have not yet registered their frame.
+        for (;;) {
+            IOLockLock(fPowerCallLock);
+            const bool others = fPowerCallOutstanding > selfFrames;
+            IOLockUnlock(fPowerCallLock);
+            if (!others) break;
+            yieldGate(&fPowerCallOutstanding);
+        }
+        IOLockLock(fPowerCallLock);
+        powerOffThreadCall = calls[0];
+        powerOnThreadCall = calls[1];
+        fPowerCallDraining = false;
+        IOLockUnlock(fPowerCallLock);
+        // Our native invocation has not returned. Keep handles, registration
+        // retain and resources for a later external drain and cleanup retry.
+        return false;
+    }
+    auto drain = [&](thread_call_t call) -> bool {
+        if (!call) return true;
+        // isactive counts submitted versus completed, including invocations
+        // before frame entry and after body completion until native return.
+        while (thread_call_isactive(call)) yieldGate(call);
+        return thread_call_free(call);
+    };
+    if (drain(calls[0])) calls[0] = NULL;
+    if (drain(calls[1])) calls[1] = NULL;
+    IOLockLock(fPowerCallLock);
+    powerOffThreadCall = calls[0];
+    powerOnThreadCall = calls[1];
+    const bool drained = !calls[0] && !calls[1];
+    fPowerCallDraining = false;
+    const bool held = drained && fPowerCallOwnerHeld;
+    if (drained) {
+        pmPolicyMaker = NULL;
+        fPowerCallOwnerHeld = false;
+    }
+    IOLockUnlock(fPowerCallLock);
+    if (held) release();
+    return drained;
 }
 
 IOReturn AirportItlwm::setPowerState(unsigned long powerStateOrdinal, IOService *policyMaker)
 {
     IOReturn result = IOPMAckImplied;
-    
-    if (pmPowerState == powerStateOrdinal)
+    if (!fPowerCallLock) return result;
+    IOLockLock(fPowerCallLock);
+    if (!fPowerCallAdmission || fPowerCallStopping || pmPowerState == powerStateOrdinal) {
+        IOLockUnlock(fPowerCallLock);
         return result;
-    switch (powerStateOrdinal) {
-        case kPowerStateOff:
-            if (powerOffThreadCall) {
-                retain();
-                if (thread_call_enter(powerOffThreadCall))
-                    release();
-                result = 5000000;
-            }
-            break;
-        case kPowerStateOn:
-            if (powerOnThreadCall) {
-                retain();
-                if (thread_call_enter(powerOnThreadCall))
-                    release();
-                result = 5000000;
-            }
-            break;
-            
-        default:
-            break;
     }
+    thread_call_t call = powerStateOrdinal == kPowerStateOff ? powerOffThreadCall :
+        powerStateOrdinal == kPowerStateOn ? powerOnThreadCall : NULL;
+    if (call) {
+        retain();
+        if (thread_call_enter(call)) release();
+        else ++fPowerCallOutstanding;
+        result = 5000000;
+    }
+    IOLockUnlock(fPowerCallLock);
     return result;
 }
 
@@ -850,74 +1070,104 @@ IOReturn AirportItlwm::setWakeOnMagicPacket(bool active)
     return kIOReturnSuccess;
 }
 
-static void handleSetPowerStateOff(thread_call_param_t param0,
-                             thread_call_param_t param1)
+static IOReturn handleSetPowerStateOffGated(OSObject *owner, void *, void *, void *, void *)
 {
-    AirportItlwm *self = (AirportItlwm *)param0;
-
-    if (param1 == 0)
-    {
-        self->getCommandGate()->runAction((IOCommandGate::Action)
-                                           handleSetPowerStateOff,
-                                           (void *) 1);
-    }
-    else
-    {
-        self->setPowerStateOff();
-        self->release();
-    }
+    auto *self = OSDynamicCast(AirportItlwm, owner);
+    if (!self) return kIOReturnBadArgument;
+    IOLockLock(self->fPowerCallLock);
+    const bool admitted = self->fPowerCallAdmission && !self->fPowerCallStopping;
+    IOLockUnlock(self->fPowerCallLock);
+    if (admitted) self->setPowerStateOff();
+    else if (self->pmPolicyMaker) self->pmPolicyMaker->acknowledgeSetPowerState();
+    return kIOReturnSuccess;
 }
 
-static void handleSetPowerStateOn(thread_call_param_t param0,
-                            thread_call_param_t param1)
+static IOReturn handleSetPowerStateOnGated(OSObject *owner, void *, void *, void *, void *)
 {
-    AirportItlwm *self = (AirportItlwm *) param0;
+    auto *self = OSDynamicCast(AirportItlwm, owner);
+    if (!self) return kIOReturnBadArgument;
+    IOLockLock(self->fPowerCallLock);
+    const bool admitted = self->fPowerCallAdmission && !self->fPowerCallStopping;
+    IOLockUnlock(self->fPowerCallLock);
+    if (admitted) self->setPowerStateOn();
+    else if (self->pmPolicyMaker) self->pmPolicyMaker->acknowledgeSetPowerState();
+    return kIOReturnSuccess;
+}
 
-    if (param1 == 0)
-    {
-        self->getCommandGate()->runAction((IOCommandGate::Action)
-                                           handleSetPowerStateOn,
-                                           (void *) 1);
-    }
-    else
-    {
-        self->setPowerStateOn();
-        self->release();
-    }
+static void handleSetPowerStateOff(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<AirportItlwm *>(param0);
+    AirportItlwm::PowerCallFrame frame;
+    self->beginPowerCall(&frame);
+    IOCommandGate *gate = self->getCommandGate();
+    if (gate) gate->runAction(handleSetPowerStateOffGated);
+    self->endPowerCall(&frame);
+    self->release();
+}
+
+static void handleSetPowerStateOn(thread_call_param_t param0, thread_call_param_t)
+{
+    auto *self = static_cast<AirportItlwm *>(param0);
+    AirportItlwm::PowerCallFrame frame;
+    self->beginPowerCall(&frame);
+    IOCommandGate *gate = self->getCommandGate();
+    if (gate) gate->runAction(handleSetPowerStateOnGated);
+    self->endPowerCall(&frame);
+    self->release();
 }
 
 IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
 {
-    IOReturn ret;
-    
+    if (!policyMaker) return kIOReturnBadArgument;
+    if (!fPowerCallLock) return kIOReturnNoMemory;
+    IOLockLock(fPowerCallLock);
+    const bool busy = fPowerCallStopping || fPowerCallDraining ||
+        powerOffThreadCall || powerOnThreadCall || fPowerCallOwnerHeld;
+    if (busy) {
+        IOLockUnlock(fPowerCallLock);
+        return kIOReturnNotReady;
+    }
     pmPowerState = kPowerStateOn;
     pmPolicyMaker = policyMaker;
-    
-    powerOffThreadCall = thread_call_allocate(
-                                            (thread_call_func_t)handleSetPowerStateOff,
-                                            (thread_call_param_t)this);
-    powerOnThreadCall  = thread_call_allocate(
-                                            (thread_call_func_t)handleSetPowerStateOn,
-                                              (thread_call_param_t)this);
-    ret = pmPolicyMaker->registerPowerDriver(this,
-                                             powerStateArray,
-                                             kPowerStateCount);
-    return ret;
+    powerOffThreadCall = thread_call_allocate(handleSetPowerStateOff, this);
+    powerOnThreadCall = thread_call_allocate(handleSetPowerStateOn, this);
+    if (!powerOffThreadCall || !powerOnThreadCall) {
+        IOLockUnlock(fPowerCallLock);
+        unregistPM(false);
+        return kIOReturnNoMemory;
+    }
+    // Keep the recipient alive through the external drain and registration.
+    retain();
+    fPowerCallOwnerHeld = fPowerCallAdmission = true;
+    retain();
+    IOLockUnlock(fPowerCallLock);
+    IOReturn result = policyMaker->registerPowerDriver(this, powerStateArray, kPowerStateCount);
+    IOLockLock(fPowerCallLock);
+    const bool stopped = fPowerCallStopping;
+    IOLockUnlock(fPowerCallLock);
+    if (result != kIOReturnSuccess || stopped) unregistPM(false);
+    if (stopped) result = kIOReturnAborted;
+    release();
+    return result;
 }
 
 void AirportItlwm::setPowerStateOff()
 {
     XYLog("%s\n", __FUNCTION__);
+    IOLockLock(fPowerCallLock);
     pmPowerState = kPowerStateOff;
+    IOLockUnlock(fPowerCallLock);
     disableAdapter(fNetIf);
-    pmPolicyMaker->acknowledgeSetPowerState();
+    if (pmPolicyMaker) pmPolicyMaker->acknowledgeSetPowerState();
 }
 
 void AirportItlwm::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
+    IOLockLock(fPowerCallLock);
     pmPowerState = kPowerStateOn;
-    pmPolicyMaker->acknowledgeSetPowerState();
+    IOLockUnlock(fPowerCallLock);
+    if (pmPolicyMaker) pmPolicyMaker->acknowledgeSetPowerState();
 }
 
 int AirportItlwm::
