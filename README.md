@@ -1,3 +1,86 @@
+# AirportItlwm for macOS 15 Sequoia (Intel AX201), beta
+
+This is a fork of [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) 2.4.0
+(upstream commit `53c51c2`). It runs `AirportItlwm` on macOS 15 against Apple's own
+`IO80211Family` and `IOSkywalkFamily`. You do not need the legacy IO80211 kexts or root patches.
+Wi-Fi shows up as a normal AirPort interface in the Wi-Fi menu and System Settings.
+
+**Status: beta.** It has been tested on one machine only. Use it at your own risk and keep a
+working EFI to fall back to.
+
+## Tested on
+
+| Item | Value |
+|---|---|
+| Wi-Fi card | Intel AX201 (iwx) |
+| macOS | 15.7.7 (24G720), `IO80211Family` 1200.13.1 |
+| Board / SMBIOS | Z490-I, iMac20,2 |
+| Bootloader | OpenCore, `SecureBootModel` Disabled, SIP disabled |
+| Bluetooth | IntelBluetoothFirmware + IntelBTPatcher + BlueToolFixup |
+
+Other iwx cards (AX200, AX210, AX211) should take the same code path, but they have not been
+tested. The older iwm and iwn cards have not been tested with this fork either.
+
+## What is different from upstream
+
+- A Sequoia Skywalk interface (`AirportItlwmV2`, `AirportItlwmSkywalkInterface`) that registers with
+  the native `IO80211Family` V2 controller and data path.
+- Native handlers for the ioctls that Sequoia's `airportd` calls. These include
+  BSS info, beacon info, roaming, regulatory and the WCL (Wi-Fi connection layer) calls. They follow
+  the behaviour of Apple's own drivers wherever the Intel hardware allows it.
+- Faster and steadier reconnects. In our tests, a forced disconnect reconnected in about 0.5 s, 5 out of 5 times.
+- Bluetooth coexistence: the radio stays in constant-awake mode (CAM), and 2.4 GHz MIMO uses static
+  SMPS. Together these keep Bluetooth mouse and keyboard latency low.
+
+## Known limits
+
+- `APPLE80211_IOC_WCL_ARP_MODE` returns "unsupported" on purpose. The firmware has no ARP offload
+  that maps onto it.
+- Intel firmware has no per-connection retry or RTS knobs. The driver accepts these WCL calls but
+  cannot apply them.
+- Power save stays in CAM on purpose (see above). This costs some idle power.
+- Some registry properties (`AIRITL_TT_WQ`, `AIRITL_WQ*`) come from a work-loop timer probe.
+  They are harmless and will be removed in a later version.
+
+## Install (OpenCore)
+
+1. Copy `AirportItlwm.kext` to `EFI/OC/Kexts/`.
+2. Add it under `Kernel > Add` with `MinKernel` `24.0.0` and `MaxKernel` `24.99.99`.
+3. Disable `itlwm.kext` (HeliPort) if you have it. Only one of the two drivers may load.
+4. Do not block or force-inject `IOSkywalkFamily` or `IO80211Family`. This driver needs Apple's
+   stock versions.
+5. Reboot and check with `kextstat | grep AirportItlwm`.
+
+To roll back, disable the entry again, or put your previous kext back.
+
+## Debug logging
+
+By default the driver logs only errors and a few state changes. To turn on its detailed connect,
+roam and WCL logs, add the boot-arg `-airitldbg`. They go to the kernel log, so read them with
+`sudo dmesg`. Messages logged before the boot-arg is read (very early in `start`) do not appear,
+even with `-airitldbg` set.
+
+## Build
+
+```sh
+git clone https://github.com/acidanthera/MacKernelSDK
+xcodebuild -project itlwm.xcodeproj -target AirportItlwm-Sonoma14.4 -configuration Release build
+```
+
+The `AirportItlwm-Sonoma14.4` target is the one built for macOS 15 here: it compiles with
+`__IO80211_TARGET=__MAC_15_0`. Firmware is embedded at build time, as in upstream. The kext must be
+signed before use. An ad-hoc signature is enough for OpenCore injection:
+`codesign --force --sign - AirportItlwm.kext`.
+
+## License and credits
+
+GPL-2.0, the same as upstream (see `LICENSE`). All credit for itlwm, net80211 and the Intel
+drivers goes to the upstream authors listed below. The Sequoia work in this fork builds on them.
+
+---
+
+## Upstream README
+
 # itlwm
 
 **An Intel Wi-Fi Adapter Kernel Extension for macOS, based on the OpenBSD Project.**
